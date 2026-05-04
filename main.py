@@ -246,21 +246,27 @@ def fetch_nba_schedule(days: int = 7) -> list:
 # TENNIS — ESPN ATP + WTA scoreboard (today)
 # ============================================================================
 def fetch_tennis_live() -> tuple:
+    """
+    Fetches ALL tennis today — ATP, WTA, Challenger, WTA 125.
+    Combines all tours so Rome ATP + WTA both appear together.
+    """
     host    = "site.api.espn.com"
     session = _make_session()
     if not _resolve_host(host):
         return pd.DataFrame(), f"DNS FAILED: {host}"
  
-    for tour, slug in [("ATP", "atp"), ("WTA", "wta")]:
+    all_rows  = []
+    tours_hit = []
+ 
+    for tour, slug in [("ATP", "atp"), ("WTA", "wta"), ("ATP Challenger", "atp-challenger"), ("WTA 125", "wta-125")]:
         url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{slug}/scoreboard?dates={TODAY_ESPN}"
         try:
-            resp   = session.get(url, verify=False, timeout=15)
+            resp = session.get(url, verify=False, timeout=15)
             if resp.status_code != 200:
                 continue
             events = resp.json().get("events", [])
             if not events:
                 continue
-            rows = []
             for event in events:
                 try:
                     comp      = event["competitions"][0]
@@ -270,7 +276,7 @@ def fetch_tennis_live() -> tuple:
                          or home_team.get("team", {}).get("displayName", "P1")
                     p2 = away_team.get("athlete", {}).get("displayName") \
                          or away_team.get("team", {}).get("displayName", "P2")
-                    tournament = event.get("season", {}).get("slug", tour)
+                    tournament = event.get("name") or event.get("season", {}).get("slug", tour)
                     status     = event.get("status", {}).get("type", {}).get("description", "Scheduled")
                     p1_odds, p2_odds = None, None
                     for o in comp.get("odds", []):
@@ -281,7 +287,7 @@ def fetch_tennis_live() -> tuple:
                         if away_ml:
                             p2_odds = round(1 + 100/abs(away_ml), 2) if away_ml < 0 else round(1 + away_ml/100, 2)
                         break
-                    rows.append({
+                    all_rows.append({
                         "Match":      f"{p1} vs {p2}",
                         "Tournament": tournament,
                         "Tour":       tour,
@@ -293,12 +299,14 @@ def fetch_tennis_live() -> tuple:
                     })
                 except (KeyError, TypeError, StopIteration):
                     continue
-            if rows:
-                return pd.DataFrame(rows), f"live (ESPN {tour})"
+            tours_hit.append(tour)
         except Exception:
             continue
  
-    return pd.DataFrame(), f"No tennis matches scheduled for {TODAY}"
+    if not all_rows:
+        return pd.DataFrame(), f"No tennis matches scheduled for {TODAY}"
+ 
+    return pd.DataFrame(all_rows), "live (ESPN — " + ", ".join(tours_hit) + ")"
  
 # ============================================================================
 # TENNIS SCHEDULE — next 7 days
