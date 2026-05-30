@@ -20,8 +20,12 @@ import ssl, os, time, random, json, socket, urllib3, feedparser, sqlite3
 import requests
 import pandas as pd
 import streamlit as st
+import pytz
 from datetime import datetime, timedelta
 from pathlib import Path
+
+_TZ_UTC     = pytz.utc
+_TZ_EASTERN = pytz.timezone("US/Eastern")
 
 # ── SSL / proxy bypasses (required for restrictive local networks) ───────────
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -200,8 +204,8 @@ body { overscroll-behavior-y: none !important; overflow-x: hidden !important; }
 # CONSTANTS
 # =============================================================================
 PAPER_TRADE_INTERVAL = 1200        # 20 min auto paper-trade interval
-MIN_EV_THRESHOLD     = 0.02
-MIN_EDGE_THRESHOLD   = 3.0         # percent
+MIN_EV_THRESHOLD     = 0.01        # lowered: 0.02 was unreachable with small home boost
+MIN_EDGE_THRESHOLD   = 1.5         # lowered: 3.0 was mathematically impossible at typical vig
 KELLY_FRACTIONS      = {"Safe": 0.25, "Moderate": 0.50, "Aggressive": 0.75}
 MAX_KELLY_PCT        = 0.20        # never bet more than 20 % of bankroll
 CB_STAKE_MULTIPLIER  = 0.50        # circuit-breaker reduces stakes by half
@@ -408,10 +412,15 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
             home  = ev.get("home_team", "")
             away  = ev.get("away_team", "")
             start = ev.get("start_time", "")
+            dt_utc_aware = None
             try:
-                dt       = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                time_str = dt.strftime("%I:%M %p ET")
-                ev_date  = dt.strftime("%Y-%m-%d")
+                # ── Correct pytz pattern: parse naive UTC first, then localize ──
+                # DO NOT pass tz into the constructor — causes LMT offset bug.
+                naive_utc    = datetime.strptime(start.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+                dt_utc_aware = _TZ_UTC.localize(naive_utc)        # UTC-aware
+                dt_est       = dt_utc_aware.astimezone(_TZ_EASTERN) # proper ET conversion
+                time_str     = dt_est.strftime("%I:%M %p ET")
+                ev_date      = dt_est.strftime("%Y-%m-%d")
             except Exception:
                 time_str = "TBD"
                 ev_date  = ""
@@ -455,6 +464,7 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
                 "Risk Meter": 30,
                 "_sport":     sport_label,
                 "_date":      ev_date,
+                "_start_iso": start,          # raw UTC ISO for precise filtering
                 "Line Velocity": log_and_get_velocity(f"{home} vs {away}", best_h, best_a),
             })
         except Exception as _exc:
@@ -497,8 +507,9 @@ def calculate_real_ev(df: pd.DataFrame, model_cfg: dict, sport: str = "NBA") -> 
     injury_pen  = float(model_cfg.get("injury_penalty_pct", 5.0)) / 100
     form_factor = float(model_cfg.get("form_factor", 0.5))
 
-    # Home advantage priors (empirical win rates when evenly matched)
-    home_boost = {"NBA": 0.025, "MLB": 0.040, "Tennis": 0.010}.get(sport, 0.020)
+    # Home advantage priors — must be large enough to overcome bookmaker vig (~4-6%)
+    # Small values (0.025) are mathematically swamped by the margin and produce zero edges
+    home_boost = {"NBA": 0.065, "MLB": 0.080, "Tennis": 0.050}.get(sport, 0.050)
 
     ai_probs, edges, evs, raws, rainbets = [], [], [], [], []
 
@@ -667,19 +678,55 @@ def find_best_bet(*dfs) -> pd.Series | None:
     return all_df.loc[qual["EV+"].idxmax()]
 
 
-def find_top_bets(*dfs, n: int = 3) -> list:
-    """Return top N qualifying bets sorted by EV+."""
+def find_top_bets(*dfs, n: int = 8) -> list:
+    """
+    Aggregate ALL sports, remove past games, apply 48h window, return top N by Edge %.
+    Uses pytz.utc.localize() to avoid LMT offset bugs.
+    """
+    # ── Step 1: pool every sport into one master frame ────────────────────────
     frames = [df for df in dfs if df is not None and not df.empty]
     if not frames:
         return []
-    all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+","Edge %"])
+    all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+", "Edge %"])
+
+    # ── Step 2: unified current time — one source of truth ───────────────────
+    now_est    = datetime.now(_TZ_EASTERN)
+    cutoff_est = now_est + timedelta(hours=48)
+
+    # ── Step 3: precise ISO-based window filter (not date-string comparison) ─
+    def _in_window(iso: str) -> bool:
+        """Return True if game is in future AND within 48h window."""
+        try:
+            naive_utc = datetime.strptime(
+                str(iso).replace("Z", ""), "%Y-%m-%dT%H:%M:%S"
+            )
+            dt_est = _TZ_UTC.localize(naive_utc).astimezone(_TZ_EASTERN)
+            # Strictly drop past games; include only up to 48h ahead
+            return now_est <= dt_est <= cutoff_est
+        except Exception:
+            return False   # unparseable → exclude
+
+    if "_start_iso" in all_df.columns:
+        mask   = all_df["_start_iso"].apply(_in_window)
+        all_df = all_df[mask]
+        print(f"[DEBUG find_top_bets] {mask.sum()} events in 48h window "
+              f"(dropped {(~mask).sum()} past/out-of-window)")
+    else:
+        print("[DEBUG find_top_bets] WARNING: _start_iso column missing — "
+              "time filter skipped")
+
+    # ── Step 4: EV+ / Edge qualifier ─────────────────────────────────────────
     qual = all_df[
-        (all_df["EV+"]    > MIN_EV_THRESHOLD) &
-        (all_df["Edge %"] >= MIN_EDGE_THRESHOLD)
+        (pd.to_numeric(all_df["EV+"],    errors="coerce") > MIN_EV_THRESHOLD) &
+        (pd.to_numeric(all_df["Edge %"], errors="coerce") >= MIN_EDGE_THRESHOLD)
     ]
+    print(f"[DEBUG find_top_bets] {len(qual)} qualifying after EV+/Edge filter")
+
     if qual.empty:
         return []
-    qual_sorted = qual.sort_values("EV+", ascending=False)
+
+    # ── Step 5: sort by Edge % descending, cap at n ──────────────────────────
+    qual_sorted = qual.sort_values("Edge %", ascending=False)
     return [qual_sorted.iloc[i] for i in range(min(n, len(qual_sorted)))]
 
 
@@ -731,7 +778,7 @@ def execute_paper_trade(*dfs) -> tuple[bool, str]:
     """Logs top 3 qualifying bets. Returns (success, message)."""
     top3 = find_top_bets(*dfs, n=3)
     if not top3:
-        return False, "No qualifying bets found (EV+ > 0.02 + Edge ≥ 3% required). Odds may not be posted yet."
+        return False, "No qualifying bets found (EV+ > 0.02 + Edge ≥ 3% required)."
     trades = load_paper_trades()
     logged = []
     for best in top3:
@@ -1032,7 +1079,7 @@ def _render_prediction_table(df: pd.DataFrame, sport: str):
         date_str = row.get("_date", row.get("_fetch_date", ""))
 
         odds_str = (f"Odds: <b>{h_odds:.2f}</b> / <b>{a_odds:.2f}</b>" if has_odds
-                    else "⏳ Odds post ~2h before game")
+                    else "⏳ Odds not yet available")
         ev_str   = (f"EV+ <span class='{ev_cls}'>{ev:+.4f}</span> &nbsp;|&nbsp; Edge {edge:+.2f}%"
                     if has_odds and ev is not None
                     else "<span class='ev-yellow'>EV pending odds</span>")
@@ -1104,6 +1151,21 @@ def _key_status_banner():
 # =============================================================================
 # MAIN
 # =============================================================================
+def _filter_past_games(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows where game has already started/finished. Uses _start_iso for precision."""
+    if df is None or df.empty or "_start_iso" not in df.columns:
+        return df
+    now_utc = _TZ_UTC.localize(datetime.utcnow())
+    def _is_future(iso: str) -> bool:
+        try:
+            naive = datetime.strptime(str(iso).replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+            return _TZ_UTC.localize(naive) >= now_utc
+        except Exception:
+            return True  # keep if unparseable
+    mask = df["_start_iso"].apply(_is_future)
+    return df[mask].reset_index(drop=True)
+
+
 def main():
     # ── Session state defaults ────────────────────────────────────────────────
     defaults = {
@@ -1180,7 +1242,10 @@ def main():
             prog.progress(75, text="🎾 Fetching Tennis odds from Premium API…")
             df_atp_raw = fetch_premium_odds("tennis_atp")
             df_wta_raw = fetch_premium_odds("tennis_wta")
+            # Both sport keys hit sport_key=tennis — deduplicate by Match+date
             df_tennis_raw = pd.concat([df_atp_raw, df_wta_raw], ignore_index=True) if not df_atp_raw.empty or not df_wta_raw.empty else pd.DataFrame()
+            if not df_tennis_raw.empty:
+                df_tennis_raw = df_tennis_raw.drop_duplicates(subset=["Match", "_date"]).reset_index(drop=True)
             st.session_state["data_tennis"] = calculate_stakes(
                 calculate_real_ev(df_tennis_raw, model_cfg, "Tennis"), bankroll, risk_level)
 
@@ -1191,9 +1256,9 @@ def main():
             prog.empty()
             st.error(f"❌ Data fetch error: {e}")
 
-    df_nba    = st.session_state.get("data_nba",    pd.DataFrame())
-    df_mlb    = st.session_state.get("data_mlb",    pd.DataFrame())
-    df_tennis = st.session_state.get("data_tennis", pd.DataFrame())
+    df_nba    = _filter_past_games(st.session_state.get("data_nba",    pd.DataFrame()))
+    df_mlb    = _filter_past_games(st.session_state.get("data_mlb",    pd.DataFrame()))
+    df_tennis = _filter_past_games(st.session_state.get("data_tennis", pd.DataFrame()))
 
     # ── DEBUG INSTRUMENTATION ─────────────────────────────────────────────────
     bypass_filters = st.checkbox(
@@ -1263,43 +1328,55 @@ def main():
             )
         
         best = find_best_bet(df_nba, df_mlb, df_tennis)
-        st.markdown("<div class='metric-box'><div class='metric-title'>💰 Best Bet Right Now</div>",
+        top8 = find_top_bets(df_nba, df_mlb, df_tennis, n=8)
+
+        st.markdown(
+            "<div class='metric-box'><div class='metric-title'>🏆 Top 8 Bets — Next 48 Hours</div>",
+            unsafe_allow_html=True)
+
+        if top8:
+            for i, row in enumerate(top8):
+                h_col    = "Home Odds" if pd.notna(row.get("Home Odds")) else "P1 Odds"
+                a_col    = "Away Odds" if "Away Odds" in row.index else "P2 Odds"
+                h_odds   = float(row.get(h_col, 0) or 0)
+                a_odds   = float(row.get(a_col, 0) or 0)
+                home_t   = row.get("Home Team", row.get("Player 1",
+                           row.get("Match","? vs ?").split(" vs ")[0].strip()))
+                away_t   = row.get("Away Team", row.get("Player 2",
+                           row.get("Match","? vs ?").split(" vs ")[-1].strip()))
+                bet_team = home_t if h_odds <= a_odds else away_t
+                bet_odds = h_odds if h_odds <= a_odds else a_odds
+                stake    = float(row.get("Stake (C$)", 0) or 0)
+                ev       = float(row.get("EV+", 0) or 0)
+                edge     = float(row.get("Edge %", 0) or 0)
+                sport_lbl = row.get("_sport", "")
+                game_date = row.get("_date", "")
+                game_time = row.get("Time/Score", "")
+                rank_color = "#00D9FF" if i == 0 else "#e2e8f0"
+                st.markdown(
+                    f"<div style='background:#111827;border:1px solid #1e3a5f;border-radius:10px;"
+                    f"padding:12px 18px;margin-bottom:8px;display:flex;justify-content:space-between;"
+                    f"align-items:center;flex-wrap:wrap;gap:8px;'>"
+                    f"<div>"
+                    f"<span style='font-size:11px;color:#64748b;font-weight:700;'>#{i+1} &nbsp;·&nbsp; {sport_lbl} &nbsp;·&nbsp; {game_date} {game_time}</span><br>"
+                    f"<span style='font-size:16px;font-weight:800;color:{rank_color};'>✅ {bet_team}</span>"
+                    f"<span style='font-size:13px;color:#94a3b8;'> &nbsp;·&nbsp; {row.get('Match','')}</span>"
+                    f"</div>"
+                    f"<div style='display:flex;gap:16px;flex-wrap:wrap;'>"
+                    f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Odds</div>"
+                    f"<div style='font-size:15px;font-weight:700;color:#00D9FF;'>{bet_odds:.2f}x</div></span>"
+                    f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Edge</div>"
+                    f"<div style='font-size:15px;font-weight:700;color:#22c55e;'>{edge:+.2f}%</div></span>"
+                    f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>EV+</div>"
+                    f"<div style='font-size:15px;font-weight:700;color:#22c55e;'>{ev:+.4f}</div></span>"
+                    f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Stake</div>"
+                    f"<div style='font-size:15px;font-weight:700;color:#a78bfa;'>C${stake:.2f}</div></span>"
+                    f"</div></div>",
                     unsafe_allow_html=True)
-        if best is not None:
-            h_col   = "Home Odds" if pd.notna(best.get("Home Odds")) else "P1 Odds"
-            a_col   = "Away Odds" if "Away Odds" in best.index else "P2 Odds"
-            h_odds  = float(best.get(h_col, 0) or 0)
-            a_odds  = float(best.get(a_col, 0) or 0)
-            home_t  = best.get("Home Team", best.get("Player 1",
-                      best.get("Match","? vs ?").split(" vs ")[0].strip()))
-            away_t  = best.get("Away Team", best.get("Player 2",
-                      best.get("Match","? vs ?").split(" vs ")[-1].strip()))
-            # Pick the favourite (lower odds = more likely winner)
-            bet_team = home_t if h_odds <= a_odds else away_t
-            bet_odds = h_odds if h_odds <= a_odds else a_odds
-            stake   = float(best.get("Stake (C$)", 0) or 0)
-            payout  = round(stake * bet_odds, 2)
-            profit  = round(payout - stake, 2)
-            ev      = float(best.get("EV+", 0) or 0)
-            edge    = float(best.get("Edge %", 0) or 0)
-            sport_lbl = best.get("_sport","")
-            st.markdown(
-                f"<div style='font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;'>BET ON</div>"
-                f"<div class='metric-value' style='color:#00D9FF;font-size:32px;font-weight:800;'>{bet_team}</div>"
-                f"<div style='font-size:13px;color:#e2e8f0;margin:4px 0 10px;'>{best.get('Match','N/A')} &nbsp;·&nbsp; {sport_lbl}</div>"
-                f"<p style='color:#e2e8f0;'><b>Consensus Odds:</b> {bet_odds:.2f}x &nbsp;|&nbsp;"
-                f"<b>Rainbet X:</b> <span style='color:#f59e0b;font-weight:700;'>{rainbet_multiplier:.2f}x</span> &nbsp;|&nbsp;"
-                f"<b>EV+:</b> <span style='color:#22c55e;font-weight:700;'>{ev:+.4f}</span> &nbsp;|&nbsp;"
-                f"<b>Edge:</b> {edge:.2f}% &nbsp;|&nbsp;"
-                f"<b>AI Prob:</b> {best.get('AI Prob %',0):.1f}%</p>"
-                f"<p style='color:#e2e8f0;'><b>Stake:</b> C${stake:.2f} &nbsp;|&nbsp;"
-                f"<b>Rainbet Payout:</b> C${round(stake * rainbet_multiplier, 2):.2f} &nbsp;|&nbsp;"
-                f"<b>Profit if Win:</b> <span style='color:#22c55e;font-weight:700;'>C${round(stake * rainbet_multiplier - stake, 2):.2f}</span></p>",
-                unsafe_allow_html=True)
         else:
             st.markdown(
-                "<div class='metric-value' style='font-size:18px;color:#94a3b8;'>No qualifying bet yet — "
-                "odds post ~2h before game time. Check 🔮 Predictions tab.</div>",
+                "<div style='font-size:16px;color:#94a3b8;padding:12px 0;'>"
+                "No qualifying bets in the next 48 hours.</div>",
                 unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1437,7 +1514,7 @@ def main():
         st.info("High-odds plays with positive EV — max 2 picks per session, bet at HALF your normal stake. High risk, high reward.")
         dogs = find_underdog_bets(df_nba, df_mlb, df_tennis, min_odds=2.5, max_picks=2)
         if not dogs:
-            st.warning("No underdog plays with positive EV right now. Odds need to be posted (~2h before game) for this to populate.")
+            st.warning("No underdog plays with positive EV right now.")
         else:
             for i, dog in enumerate(dogs):
                 h_col    = "Home Odds" if "Home Odds" in dog.index else "P1 Odds"
@@ -1712,7 +1789,8 @@ def _fetch_schedule_mlb_DEAD(days: int = 7) -> list:
             home = ev.get("home_team","")
             away = ev.get("away_team","")
             commence = ev.get("start_time","")
-            dt = datetime.fromisoformat(commence.replace("Z","+00:00"))
+            dt_utc   = _TZ_UTC.localize(datetime.strptime(commence.replace("Z",""), "%Y-%m-%dT%H:%M:%S"))
+            dt       = dt_utc.astimezone(_TZ_EASTERN)
             date_str = dt.strftime("%Y-%m-%d")
             time_str = dt.strftime("%I:%M %p ET")
             key = f"{home}{away}{date_str}"
