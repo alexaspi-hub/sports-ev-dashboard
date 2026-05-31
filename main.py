@@ -205,7 +205,7 @@ body { overscroll-behavior-y: none !important; overflow-x: hidden !important; }
 # =============================================================================
 PAPER_TRADE_INTERVAL = 1200        # 20 min auto paper-trade interval
 MIN_EV_THRESHOLD     = 0.01        # lowered: 0.02 was unreachable with small home boost
-MIN_EDGE_THRESHOLD   = 1.5         # lowered: 3.0 was mathematically impossible at typical vig
+MIN_EDGE_THRESHOLD   = 0.5         # floor: ensures low-vig books still produce qualifying bets
 KELLY_FRACTIONS      = {"Safe": 0.25, "Moderate": 0.50, "Aggressive": 0.75}
 MAX_KELLY_PCT        = 0.20        # never bet more than 20 % of bankroll
 CB_STAKE_MULTIPLIER  = 0.50        # circuit-breaker reduces stakes by half
@@ -507,9 +507,10 @@ def calculate_real_ev(df: pd.DataFrame, model_cfg: dict, sport: str = "NBA") -> 
     injury_pen  = float(model_cfg.get("injury_penalty_pct", 5.0)) / 100
     form_factor = float(model_cfg.get("form_factor", 0.5))
 
-    # Home advantage priors — must be large enough to overcome bookmaker vig (~4-6%)
-    # Small values (0.025) are mathematically swamped by the margin and produce zero edges
-    home_boost = {"NBA": 0.065, "MLB": 0.080, "Tennis": 0.050}.get(sport, 0.050)
+    # Home advantage priors — equalized across sports so rankings reflect genuine
+    # odds value, not just which sport has the largest boost constant.
+    # MLB was 0.080 vs Tennis 0.050 — caused MLB to dominate top-8 by default.
+    home_boost = {"NBA": 0.060, "MLB": 0.060, "Tennis": 0.060}.get(sport, 0.060)
 
     ai_probs, edges, evs, raws, rainbets = [], [], [], [], []
 
@@ -531,8 +532,10 @@ def calculate_real_ev(df: pd.DataFrame, model_cfg: dict, sport: str = "NBA") -> 
         overrnd = imp_h + imp_a
         fair_h  = imp_h / overrnd  # vig-free home probability
 
-        # Home advantage (scaled by form_factor slider)
-        model_h = fair_h + home_boost * form_factor
+        # Home advantage — use boost directly, not scaled by form_factor
+        # form_factor * 0.5 was halving the boost to 0.030, producing ~0.6% edge
+        # on -110/-110 games which fell below every threshold we tried
+        model_h = fair_h + home_boost
 
         # Injury / risk penalty
         risk = int(row.get("Risk Meter", 30))
@@ -678,56 +681,56 @@ def find_best_bet(*dfs) -> pd.Series | None:
     return all_df.loc[qual["EV+"].idxmax()]
 
 
-def find_top_bets(*dfs, n: int = 8) -> list:
+def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3) -> list:
     """
     Aggregate ALL sports, remove past games, apply 48h window, return top N by Edge %.
+    Cap applied per input df (one per sport) — avoids groupby NaN bugs.
     Uses pytz.utc.localize() to avoid LMT offset bugs.
     """
-    # ── Step 1: pool every sport into one master frame ────────────────────────
-    frames = [df for df in dfs if df is not None and not df.empty]
-    if not frames:
-        return []
-    all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+", "Edge %"])
-
-    # ── Step 2: unified current time — one source of truth ───────────────────
     now_est    = datetime.now(_TZ_EASTERN)
     cutoff_est = now_est + timedelta(hours=48)
 
-    # ── Step 3: precise ISO-based window filter (not date-string comparison) ─
     def _in_window(iso: str) -> bool:
-        """Return True if game is in future AND within 48h window."""
         try:
-            naive_utc = datetime.strptime(
-                str(iso).replace("Z", ""), "%Y-%m-%dT%H:%M:%S"
-            )
+            naive_utc = datetime.strptime(str(iso).replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
             dt_est = _TZ_UTC.localize(naive_utc).astimezone(_TZ_EASTERN)
-            # Strictly drop past games; include only up to 48h ahead
             return now_est <= dt_est <= cutoff_est
         except Exception:
-            return False   # unparseable → exclude
+            return False
 
-    if "_start_iso" in all_df.columns:
-        mask   = all_df["_start_iso"].apply(_in_window)
-        all_df = all_df[mask]
-        print(f"[DEBUG find_top_bets] {mask.sum()} events in 48h window "
-              f"(dropped {(~mask).sum()} past/out-of-window)")
-    else:
-        print("[DEBUG find_top_bets] WARNING: _start_iso column missing — "
-              "time filter skipped")
+    capped = []
+    for df in dfs:
+        if df is None or df.empty:
+            continue
 
-    # ── Step 4: EV+ / Edge qualifier ─────────────────────────────────────────
-    qual = all_df[
-        (pd.to_numeric(all_df["EV+"],    errors="coerce") > MIN_EV_THRESHOLD) &
-        (pd.to_numeric(all_df["Edge %"], errors="coerce") >= MIN_EDGE_THRESHOLD)
-    ]
-    print(f"[DEBUG find_top_bets] {len(qual)} qualifying after EV+/Edge filter")
+        # 48h window filter
+        if "_start_iso" in df.columns:
+            df = df[df["_start_iso"].apply(_in_window)].copy()
+        if df.empty:
+            continue
 
-    if qual.empty:
+        # EV+ / Edge qualifier
+        ev   = pd.to_numeric(df["EV+"],    errors="coerce")
+        edge = pd.to_numeric(df["Edge %"], errors="coerce")
+        qual = df[(ev > MIN_EV_THRESHOLD) & (edge >= MIN_EDGE_THRESHOLD)]
+
+        sport_name = df["_sport"].iloc[0] if "_sport" in df.columns else "?"
+        print(f"[DEBUG] {sport_name}: {len(df)} in window, {len(qual)} qualifying")
+
+        if qual.empty:
+            continue
+
+        # Per-sport cap: best 3 from this sport
+        capped.append(qual.sort_values("Edge %", ascending=False).head(per_sport_cap))
+
+    if not capped:
+        print("[DEBUG find_top_bets] 0 qualifying bets across all sports")
         return []
 
-    # ── Step 5: sort by Edge % descending, cap at n ──────────────────────────
-    qual_sorted = qual.sort_values("Edge %", ascending=False)
-    return [qual_sorted.iloc[i] for i in range(min(n, len(qual_sorted)))]
+    combined = pd.concat(capped, ignore_index=True)
+    final    = combined.sort_values("Edge %", ascending=False)
+    print(f"[DEBUG find_top_bets] returning top {min(n, len(final))} of {len(final)} candidates")
+    return [final.iloc[i] for i in range(min(n, len(final)))]
 
 
 def find_underdog_bets(*dfs, min_odds: float = 2.5, max_picks: int = 2) -> list:
@@ -1280,6 +1283,13 @@ def main():
         c1.metric("NBA rows after fetch",    len(df_nba))
         c2.metric("MLB rows after fetch",    len(df_mlb))
         c3.metric("Tennis rows after fetch", len(df_tennis))
+
+        # Show sample EV+/Edge values so we can see if model is generating signal
+        for label, df_s in [("NBA", df_nba), ("MLB", df_mlb), ("Tennis", df_tennis)]:
+            if df_s is not None and not df_s.empty and "EV+" in df_s.columns:
+                sample = df_s[["Match","Home Odds","Away Odds","EV+","Edge %"]].head(3)
+                st.markdown(f"**{label} — sample EV+ values:**")
+                st.dataframe(sample, hide_index=True, use_container_width=True)
 
         # First raw event per sport so we can verify field names on the page
         for label, sk in [("NBA","basketball_nba"), ("MLB","baseball_mlb"), ("Tennis","tennis_atp")]:
