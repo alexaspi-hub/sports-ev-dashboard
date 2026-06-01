@@ -681,14 +681,17 @@ def find_best_bet(*dfs) -> pd.Series | None:
     return all_df.loc[qual["EV+"].idxmax()]
 
 
-def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3) -> list:
+def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3, hours: int = 48) -> list:
     """
-    Aggregate ALL sports, remove past games, apply 48h window, return top N by Edge %.
-    Cap applied per input df (one per sport) — avoids groupby NaN bugs.
+    Aggregate ALL sports, remove past games, apply window, return top N by Edge %.
+    Per-sport caps: MLB=2, others=3 — prevents MLB volume dominating.
     Uses pytz.utc.localize() to avoid LMT offset bugs.
     """
+    # Sport-specific caps — MLB gets 2 slots max to let Tennis/NBA shine
+    SPORT_CAPS = {"MLB": 2, "NBA": per_sport_cap, "Tennis": per_sport_cap}
+
     now_est    = datetime.now(_TZ_EASTERN)
-    cutoff_est = now_est + timedelta(hours=48)
+    cutoff_est = now_est + timedelta(hours=hours)
 
     def _in_window(iso: str) -> bool:
         try:
@@ -715,13 +718,14 @@ def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3) -> list:
         qual = df[(ev > MIN_EV_THRESHOLD) & (edge >= MIN_EDGE_THRESHOLD)]
 
         sport_name = df["_sport"].iloc[0] if "_sport" in df.columns else "?"
-        print(f"[DEBUG] {sport_name}: {len(df)} in window, {len(qual)} qualifying")
+        cap = SPORT_CAPS.get(sport_name, per_sport_cap)
+        print(f"[DEBUG] {sport_name}: {len(df)} in window, {len(qual)} qualifying (cap={cap})")
 
         if qual.empty:
             continue
 
-        # Per-sport cap: best 3 from this sport
-        capped.append(qual.sort_values("Edge %", ascending=False).head(per_sport_cap))
+        # Per-sport cap: best slots from this sport
+        capped.append(qual.sort_values("Edge %", ascending=False).head(cap))
 
     if not capped:
         print("[DEBUG find_top_bets] 0 qualifying bets across all sports")
@@ -1059,7 +1063,7 @@ def _render_schedule(events: list, sport_filter: str = "All"):
                 f"</div>", unsafe_allow_html=True)
 
 def _render_prediction_table(df: pd.DataFrame, sport: str):
-    """Render advance prediction cards sorted by EV+."""
+    """Render advance prediction cards grouped by date, sorted by EV+ within each day."""
     if df is None or df.empty:
         st.info(f"No {sport} predictions available. Check your API-Sports key.")
         return
@@ -1067,62 +1071,88 @@ def _render_prediction_table(df: pd.DataFrame, sport: str):
     h_col = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
     a_col = "Away Odds" if "Away Odds" in df.columns else "P2 Odds"
 
-    df_sorted = df.copy()
-    df_sorted["_ev_sort"] = pd.to_numeric(df_sorted.get("EV+"), errors="coerce").fillna(-99)
-    df_sorted = df_sorted.sort_values("_ev_sort", ascending=False).drop(columns=["_ev_sort"])
+    df_work = df.copy()
+    df_work["_ev_sort"]  = pd.to_numeric(df_work.get("EV+"), errors="coerce").fillna(-99)
+    df_work["_date_key"] = df_work.get("_date", df_work.get("_fetch_date", "")).fillna("").astype(str)
 
-    for _, row in df_sorted.iterrows():
-        ev  = row.get("EV+")
-        edge = row.get("Edge %")
-        stake = row.get("Stake (C$)")
-        h_odds = row.get(h_col)
-        a_odds = row.get(a_col)
-        has_odds = pd.notna(h_odds) and pd.notna(a_odds)
-        ev_cls = _ev_color(ev) if has_odds else "ev-yellow"
-        date_str = row.get("_date", row.get("_fetch_date", ""))
+    # Sort by date asc, then EV+ desc within each date
+    df_work = df_work.sort_values(["_date_key", "_ev_sort"], ascending=[True, False])
 
-        odds_str = (f"Odds: <b>{h_odds:.2f}</b> / <b>{a_odds:.2f}</b>" if has_odds
-                    else "⏳ Odds not yet available")
-        ev_str   = (f"EV+ <span class='{ev_cls}'>{ev:+.4f}</span> &nbsp;|&nbsp; Edge {edge:+.2f}%"
-                    if has_odds and ev is not None
-                    else "<span class='ev-yellow'>EV pending odds</span>")
-        stake_str = (f"&nbsp;|&nbsp; Stake: <b>C${stake:.2f}</b>"
-                     if has_odds and stake and stake > 0 else "")
+    # Group and render
+    for date_key, group in df_work.groupby("_date_key", sort=False):
+        # Date header
+        try:
+            day_label = datetime.strptime(date_key, "%Y-%m-%d").strftime("%A, %B %d")
+        except Exception:
+            day_label = date_key or "TBD"
+        st.markdown(
+            f"<div style='margin:18px 0 8px;padding:6px 14px;"
+            f"background:#0f172a;border-left:3px solid #00D9FF;"
+            f"border-radius:0 6px 6px 0;'>"
+            f"<span style='font-size:13px;font-weight:700;color:#00D9FF;"
+            f"text-transform:uppercase;letter-spacing:1px;'>📅 {day_label}"
+            f" &nbsp;·&nbsp; {len(group)} game{'s' if len(group)!=1 else ''}</span>"
+            f"</div>",
+            unsafe_allow_html=True)
 
-        pitcher_str = ""
-        if sport == "MLB":
-            ph = row.get("Home Pitcher","TBD")
-            pa = row.get("Away Pitcher","TBD")
-            pitcher_str = f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>SP: {ph} vs {pa}</div>"
+        for _, row in group.iterrows():
+            ev     = row.get("EV+")
+            edge   = row.get("Edge %")
+            stake  = row.get("Stake (C$)")
+            h_odds = row.get(h_col)
+            a_odds = row.get(a_col)
+            has_odds = pd.notna(h_odds) and pd.notna(a_odds)
+            ev_cls   = _ev_color(ev) if has_odds else "ev-yellow"
+            date_str = row.get("_date", row.get("_fetch_date", ""))
 
-        tour_str = ""
-        if sport == "Tennis":
-            tour_str = f"<div style='font-size:11px;color:#94a3b8;'>{row.get('Tournament','')} — {row.get('Category','')}</div>"
+            odds_str = (f"Odds: <b>{h_odds:.2f}</b> / <b>{a_odds:.2f}</b>" if has_odds
+                        else "⏳ Odds not yet available")
+            ev_str   = (f"EV+ <span class='{ev_cls}'>{ev:+.4f}</span> &nbsp;|&nbsp; Edge {edge:+.2f}%"
+                        if has_odds and ev is not None
+                        else "<span class='ev-yellow'>EV pending odds</span>")
+            stake_str = (f"&nbsp;|&nbsp; Stake: <b>C${stake:.2f}</b>"
+                         if has_odds and stake and stake > 0 else "")
 
-        # Build bet recommendation string
-        bet_team = ""
-        if has_odds:
-            home_t = row.get("Home Team", row.get("Player 1",
-                     row.get("Match","? vs ?").split(" vs ")[0].strip()))
-            away_t = row.get("Away Team", row.get("Player 2",
-                     row.get("Match","? vs ?").split(" vs ")[-1].strip()))
-            h_f = float(h_odds)
-            a_f = float(a_odds)
-            # Sanity check: implied prob sum must be between 0.95 and 1.25
-            # Real bookmaker margins sit in that range. Anything outside = corrupted line
-            # (e.g. grabbing a 3-way draw market or alt line by accident)
-            imp_sum = (1 / h_f) + (1 / a_f) if h_f > 1 and a_f > 1 else 0
-            if imp_sum < 0.95 or imp_sum > 1.25:
-                odds_str = f"⚠️ Bad line ({h_f:.2f}/{a_f:.2f}, margin {(imp_sum-1)*100:+.1f}%) — 3-way or alt market"
-                ev_str   = "<span class='ev-red'>Corrupted odds — do not bet</span>"
-                stake_str = ""
-            else:
-                rec_team = home_t if h_f <= a_f else away_t
-                rec_odds = h_f if h_f <= a_f else a_f
-                bet_tag  = f"<span style='color:#00D9FF;font-weight:700;'>✅ BET ON: {rec_team} @ {rec_odds:.2f}x</span>" if (ev is not None and float(ev) > MIN_EV_THRESHOLD) else f"<span style='color:#64748b;'>⛔ No edge — skip</span>"
-                odds_str = f"{bet_tag} &nbsp;|&nbsp; Lines: <b>{h_f:.2f}</b> / <b>{a_f:.2f}</b>"
+            pitcher_str = ""
+            if sport == "MLB":
+                ph = row.get("Home Pitcher", "TBD")
+                pa = row.get("Away Pitcher", "TBD")
+                pitcher_str = f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>SP: {ph} vs {pa}</div>"
 
-        st.markdown(f"<div class='pred-card'><div class='pred-match'>{row.get('Match','')} <span style='font-size:11px;color:#64748b;font-weight:400;margin-left:8px;'>{date_str} &nbsp;|&nbsp; {row.get('Time/Score', row.get('Time','TBD'))}</span></div>{tour_str}{pitcher_str}<div style='font-size:13px;margin-top:6px;'>{odds_str}</div><div style='font-size:13px;margin-top:4px;'>{ev_str}{stake_str}</div></div>", unsafe_allow_html=True)
+            tour_str = ""
+            if sport == "Tennis":
+                tour_str = f"<div style='font-size:11px;color:#94a3b8;'>{row.get('Tournament','')} — {row.get('Category','')}</div>"
+
+            bet_tag = ""
+            if has_odds:
+                home_t  = row.get("Home Team", row.get("Player 1",
+                          row.get("Match","? vs ?").split(" vs ")[0].strip()))
+                away_t  = row.get("Away Team", row.get("Player 2",
+                          row.get("Match","? vs ?").split(" vs ")[-1].strip()))
+                h_f = float(h_odds)
+                a_f = float(a_odds)
+                imp_sum = (1/h_f + 1/a_f) if h_f > 1 and a_f > 1 else 0
+                if imp_sum < 0.95 or imp_sum > 1.25:
+                    odds_str = f"⚠️ Bad line ({h_f:.2f}/{a_f:.2f})"
+                    ev_str   = "<span class='ev-red'>Corrupted odds — do not bet</span>"
+                    stake_str = ""
+                else:
+                    rec_team = home_t if h_f <= a_f else away_t
+                    rec_odds = h_f if h_f <= a_f else a_f
+                    bet_tag  = (f"<span style='color:#00D9FF;font-weight:700;'>✅ BET ON: {rec_team} @ {rec_odds:.2f}x</span>"
+                                if ev is not None and float(ev) > MIN_EV_THRESHOLD
+                                else "<span style='color:#64748b;'>⛔ No edge — skip</span>")
+                    odds_str = f"{bet_tag} &nbsp;|&nbsp; Lines: <b>{h_f:.2f}</b> / <b>{a_f:.2f}</b>"
+
+            st.markdown(
+                f"<div class='pred-card'>"
+                f"<div class='pred-match'>{row.get('Match','')} "
+                f"<span style='font-size:11px;color:#64748b;font-weight:400;margin-left:8px;'>"
+                f"{row.get('Time/Score', row.get('Time','TBD'))}</span></div>"
+                f"{tour_str}{pitcher_str}"
+                f"<div style='font-size:13px;margin-top:6px;'>{odds_str}</div>"
+                f"<div style='font-size:13px;margin-top:4px;'>{ev_str}{stake_str}</div>"
+                f"</div>", unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -1338,10 +1368,10 @@ def main():
             )
         
         best = find_best_bet(df_nba, df_mlb, df_tennis)
-        top8 = find_top_bets(df_nba, df_mlb, df_tennis, n=8)
+        top8 = find_top_bets(df_nba, df_mlb, df_tennis, n=4, hours=24)
 
         st.markdown(
-            "<div class='metric-box'><div class='metric-title'>🏆 Top 8 Bets — Next 48 Hours</div>",
+            "<div class='metric-box'><div class='metric-title'>🏆 Top 4 Bets — Next 24 Hours</div>",
             unsafe_allow_html=True)
 
         if top8:
