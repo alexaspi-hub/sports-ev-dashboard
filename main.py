@@ -489,30 +489,25 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
 # =============================================================================
 def calculate_real_ev(df: pd.DataFrame, model_cfg: dict, sport: str = "NBA") -> pd.DataFrame:
     """
-    Compute AI probability, edge %, EV+ for each row.
+    Compute AI probability, edge %, EV+ for BOTH sides of each match.
+    Picks whichever side has higher EV as the recommended bet.
+    Outputs Rec Team + Rec Odds so UI never second-guesses the model.
 
-    Model:
-      1. Remove bookmaker vig → fair probabilities
-      2. Apply home advantage (sport-specific)
-      3. Apply injury penalty (from Risk Meter)
-      4. Blend with user confidence scalar
-      5. Compute EV+ = model_prob × (odds−1) − (1−model_prob)
-      6. Edge % = (model_prob − implied_prob) × 100
+    Boosts: Tennis=0 (neutral courts), NBA=0.025, MLB=0.015.
     """
     if df is None or df.empty:
         return df
     df = df.copy()
 
-    confidence  = float(model_cfg.get("model_confidence", 1.0))
-    injury_pen  = float(model_cfg.get("injury_penalty_pct", 5.0)) / 100
-    form_factor = float(model_cfg.get("form_factor", 0.5))
+    confidence = float(model_cfg.get("model_confidence", 1.0))
+    injury_pen = float(model_cfg.get("injury_penalty_pct", 5.0)) / 100
 
-    # Home advantage priors — equalized across sports so rankings reflect genuine
-    # odds value, not just which sport has the largest boost constant.
-    # MLB was 0.080 vs Tennis 0.050 — caused MLB to dominate top-8 by default.
-    home_boost = {"NBA": 0.060, "MLB": 0.060, "Tennis": 0.060}.get(sport, 0.060)
+    # Tennis played on neutral courts — no home boost.
+    # NBA/MLB boosted conservatively to avoid false positives.
+    home_boost = {"NBA": 0.025, "MLB": 0.015, "Tennis": 0.000}.get(sport, 0.000)
 
     ai_probs, edges, evs, raws, rainbets = [], [], [], [], []
+    rec_teams, rec_odds_list               = [], []
 
     h_col = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
     a_col = "Away Odds" if "Away Odds" in df.columns else "P2 Odds"
@@ -521,106 +516,77 @@ def calculate_real_ev(df: pd.DataFrame, model_cfg: dict, sport: str = "NBA") -> 
         h_odds = pd.to_numeric(row.get(h_col), errors="coerce")
         a_odds = pd.to_numeric(row.get(a_col), errors="coerce")
 
+        home_name = row.get("Home Team", row.get("Player 1",
+                    row.get("Match", "Home").split(" vs ")[0].strip()))
+        away_name = row.get("Away Team", row.get("Player 2",
+                    row.get("Match", "Away").split(" vs ")[-1].strip()))
+
         if pd.isna(h_odds) or pd.isna(a_odds) or h_odds <= 1.01 or a_odds <= 1.01:
-            ai_probs.append(None); edges.append(None)
-            evs.append(None);      raws.append(None)
-            rainbets.append(None)
+            for lst in [ai_probs, edges, evs, raws, rainbets, rec_teams, rec_odds_list]:
+                lst.append(None)
             continue
 
         imp_h   = 1.0 / h_odds
         imp_a   = 1.0 / a_odds
         overrnd = imp_h + imp_a
-        fair_h  = imp_h / overrnd  # vig-free home probability
+        fair_h  = imp_h / overrnd
+        fair_a  = imp_a / overrnd
 
-        # Home advantage — use boost directly, not scaled by form_factor
-        # form_factor * 0.5 was halving the boost to 0.030, producing ~0.6% edge
-        # on -110/-110 games which fell below every threshold we tried
+        # Apply home boost to home side, subtract from away
         model_h = fair_h + home_boost
+        model_a = fair_a - home_boost
 
-        # Injury / risk penalty
+        # Injury / risk penalty applied to both sides
         risk = int(row.get("Risk Meter", 30))
-        if risk >= 65:
-            model_h -= injury_pen
-        elif risk >= 35:
-            model_h -= injury_pen * 0.5
+        pen  = injury_pen if risk >= 65 else (injury_pen * 0.5 if risk >= 35 else 0)
+        model_h = max(0.01, model_h - pen)
+        model_a = max(0.01, model_a - pen)
 
-        # Confidence blend: interpolate between fair and model
+        # Confidence blend
         model_h = fair_h + (model_h - fair_h) * confidence
-        model_h = max(0.02, min(0.98, model_h))
+        model_a = fair_a + (model_a - fair_a) * confidence
 
-        ev_val   = round(model_h * (h_odds - 1) - (1.0 - model_h), 4)
-        edge_val = round((model_h - imp_h) * 100, 2)
+        # EV and edge for both sides
+        ev_h    = (model_h * (h_odds - 1)) - (1.0 - model_h)
+        ev_a    = (model_a * (a_odds - 1)) - (1.0 - model_a)
+        edge_h  = (model_h - imp_h) * 100
+        edge_a  = (model_a - imp_a) * 100
 
-        ai_probs.append(round(model_h * 100, 1))
-        edges.append(edge_val)
-        evs.append(ev_val)
-        raws.append(model_h)
-        rainbets.append(h_odds)   # decimal odds = Rainbet multiplier
+        # Pick the better side as the recommendation
+        if ev_h >= ev_a:
+            best_ev, best_edge, best_prob, best_odds, best_team = ev_h, edge_h, model_h, h_odds, home_name
+        else:
+            best_ev, best_edge, best_prob, best_odds, best_team = ev_a, edge_a, model_a, a_odds, away_name
+
+        ai_probs.append(round(best_prob * 100, 1))
+        edges.append(round(best_edge, 2))
+        evs.append(round(best_ev, 4))
+        raws.append(best_prob)
+        rainbets.append(best_odds)
+        rec_teams.append(best_team)
+        rec_odds_list.append(round(best_odds, 3))
 
     df["AI Prob %"]    = ai_probs
     df["Edge %"]       = edges
     df["EV+"]          = evs
     df["_ai_prob_raw"] = raws
     df["Rainbet Odds"] = rainbets
+    df["Rec Team"]     = rec_teams
+    df["Rec Odds"]     = rec_odds_list
     return df
 
 
 # =============================================================================
 # KELLY STAKES — With Simultaneous Bet Covariance Shield
 # =============================================================================
-def calculate_stakes(df: pd.DataFrame, bankroll: float, risk_level: str) -> pd.DataFrame:
-    """
-    Advanced Fractional Kelly with automatic Multi-Game Overbet Shield.
-    Balances risk when multiple games occur in the same time block.
-    """
+def calculate_stakes(df: pd.DataFrame, bankroll: float, bet_pct: float) -> pd.DataFrame:
+    """Flat stake = bankroll × bet_pct% for every qualifying bet."""
     if df is None or df.empty:
         return df
-    df = df.copy()
-    h_col  = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
-    
-    # Count active simultaneous trades (qualifying bets with EV+ > threshold)
-    ev_vals = pd.to_numeric(df.get("EV+"), errors="coerce").fillna(0)
-    active_simultaneous_trades = max(1, int((ev_vals > MIN_EV_THRESHOLD).sum()))
-    
-    stakes = []
-    for _, row in df.iterrows():
-        h_odds = pd.to_numeric(row.get(h_col), errors="coerce")
-        raw    = row.get("_ai_prob_raw")
-        
-        if pd.isna(h_odds) or raw is None:
-            stakes.append(None)
-            continue
-            
-        prob = float(raw)
-        b    = h_odds - 1.0
-        edge = prob * b - (1.0 - prob)
-        
-        if edge <= 0:
-            stakes.append(0.0)
-        else:
-            # Get Kelly fraction from risk level
-            frac = KELLY_FRACTIONS.get(risk_level, 0.5)
-            
-            # Raw Kelly calculation
-            raw_kelly = edge / b
-            
-            # Apply fractional Kelly
-            fractional_kelly = raw_kelly * frac
-            
-            # COVARIANCE SHIELD: Scale down risk if multiple games run concurrently
-            if active_simultaneous_trades > 1:
-                # Diminishing scaling factor using square root of simultaneous exposure
-                fractional_kelly = fractional_kelly / (active_simultaneous_trades ** 0.5)
-            
-            # Hard cap at 5% max bankroll allocation per single trade (circuit breaker)
-            final_pct = min(fractional_kelly, 0.05)
-            
-            # Apply circuit breaker multiplier if active
-            final_stake = final_pct * bankroll * CB_STAKE_MULTIPLIER
-            stakes.append(round(max(final_stake, 0.0), 2))
-    
-    df["Stake (C$)"] = stakes
-    df["_simultaneous_trades"] = active_simultaneous_trades  # Track for display
+    df   = df.copy()
+    flat = round(bankroll * bet_pct / 100, 2)
+    ev   = pd.to_numeric(df.get("EV+"), errors="coerce").fillna(0)
+    df["Stake (C$)"] = [flat if v > MIN_EV_THRESHOLD else 0.0 for v in ev]
     return df
 
 
@@ -629,8 +595,7 @@ def calculate_stakes(df: pd.DataFrame, bankroll: float, risk_level: str) -> pd.D
 # Runs for today + next N days; shows predictions even when odds not yet posted
 # =============================================================================
 def build_advance_predictions(days_ahead: int, sport: str,
-                               model_cfg: dict, bankroll: float,
-                               risk_level: str) -> pd.DataFrame:
+                               bankroll: float, bet_pct: float) -> pd.DataFrame:
     """
     Fetch ALL upcoming games in one call (Odds API returns everything at once).
     Filter to today + days_ahead window. Deduplicates by match+date.
@@ -645,6 +610,7 @@ def build_advance_predictions(days_ahead: int, sport: str,
         combined = pd.concat([atp, wta], ignore_index=True) if not atp.empty or not wta.empty else pd.DataFrame()
         if combined.empty:
             return pd.DataFrame()
+        combined = combined.drop_duplicates(subset=["Match", "_date"]).reset_index(drop=True)
         # filter to today → cutoff window
         combined = combined[combined["_date"].between(str(today), str(cutoff))].reset_index(drop=True)
         combined["_fetch_date"] = combined["_date"]
@@ -659,8 +625,8 @@ def build_advance_predictions(days_ahead: int, sport: str,
             return pd.DataFrame()
         combined["_fetch_date"] = combined["_date"]
 
-    combined = calculate_real_ev(combined, model_cfg, sport)
-    combined = calculate_stakes(combined, bankroll, risk_level)
+    combined = calculate_real_ev(combined, load_sport_configs().get(sport, {}), sport)
+    combined = calculate_stakes(combined, bankroll, bet_pct)
     return combined
 
 
@@ -737,23 +703,42 @@ def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3, hours: int = 48) -> 
     return [final.iloc[i] for i in range(min(n, len(final)))]
 
 
-def find_underdog_bets(*dfs, min_odds: float = 2.5, max_picks: int = 2) -> list:
-    """Find high-odds plays with positive EV — max 2 per day, half stake."""
+def find_underdog_bets(*dfs, min_odds: float = 2.0, max_odds: float = 4.5, max_picks: int = 2) -> list:
+    """
+    Find genuine home underdogs the model rates as good value.
+    Rules:
+      - Home team must BE the underdog (h_odds > a_odds)
+      - Odds between 2.0x–4.5x — competitive, not a blowout
+      - EV+ > 0.05 — meaningful edge, not noise
+      - Edge % >= 2.0 — real model conviction
+      - AI win probability >= 25% — confirms the team has a real shot
+    Sorted by EV+ descending, max 2 picks.
+    """
     frames = [df for df in dfs if df is not None and not df.empty]
     if not frames:
         return []
-    all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+","Edge %"])
+    all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+", "Edge %"])
     h_col = "Home Odds" if "Home Odds" in all_df.columns else "P1 Odds"
     a_col = "Away Odds" if "Away Odds" in all_df.columns else "P2 Odds"
-    home_odds = pd.to_numeric(all_df.get(h_col, pd.Series(dtype=float)), errors="coerce").fillna(0)
-    away_odds = pd.to_numeric(all_df.get(a_col, pd.Series(dtype=float)), errors="coerce").fillna(0)
-    best_odds = away_odds.where(away_odds >= home_odds, home_odds)
-    mask = (best_odds >= min_odds) & (all_df["EV+"] > 0)
+
+    home_odds = pd.to_numeric(all_df.get(h_col),           errors="coerce").fillna(0)
+    away_odds = pd.to_numeric(all_df.get(a_col),           errors="coerce").fillna(0)
+    ev_vals   = pd.to_numeric(all_df["EV+"],               errors="coerce").fillna(0)
+    edge_vals = pd.to_numeric(all_df["Edge %"],            errors="coerce").fillna(0)
+    ai_prob   = pd.to_numeric(all_df.get("_ai_prob_raw"),  errors="coerce").fillna(0)
+
+    mask = (
+        (home_odds >= min_odds) &   # home is underdog territory
+        (home_odds <= max_odds) &   # cap: not a hopeless mismatch
+        (home_odds > away_odds) &   # confirm home IS the underdog side
+        (ev_vals   > 0.05)       &  # meaningful EV, not noise
+        (edge_vals >= 2.0)       &  # real model conviction
+        (ai_prob   >= 0.25)         # model gives them at least 1-in-4 chance of winning
+    )
     dogs = all_df[mask].copy()
     if dogs.empty:
         return []
-    dogs["_dog_odds"] = best_odds[mask].values
-    dogs = dogs.sort_values("_dog_odds", ascending=False)
+    dogs = dogs.sort_values("EV+", ascending=False)
     return [dogs.iloc[i] for i in range(min(max_picks, len(dogs)))]
 
 
@@ -882,23 +867,30 @@ def load_bankroll_config() -> dict:
             return json.loads(BANKROLL_CONFIG.read_text())
         except Exception:
             pass
-    return {"starting_bankroll": 1500.0, "min_stake": 10.0,
-            "max_stake": 500.0, "max_drawdown_pct": 25.0, "kelly_fraction": "Moderate"}
+    return {"bankroll": 1500.0, "bet_pct": 2.0}
 
 def save_bankroll_config(cfg: dict):
     BANKROLL_CONFIG.write_text(json.dumps(cfg, indent=2))
 
-def load_model_config() -> dict:
-    if MODEL_CONFIG.exists():
+SPORT_CONFIG = Path("sport_settings.json")
+
+def load_sport_configs() -> dict:
+    defaults = {
+        "NBA":    {"model_confidence": 1.0, "injury_penalty_pct": 5.0},
+        "MLB":    {"model_confidence": 1.0, "injury_penalty_pct": 3.0},
+        "Tennis": {"model_confidence": 1.0, "injury_penalty_pct": 7.0},
+    }
+    if SPORT_CONFIG.exists():
         try:
-            return json.loads(MODEL_CONFIG.read_text())
+            saved = json.loads(SPORT_CONFIG.read_text())
+            for sport in defaults:
+                defaults[sport].update(saved.get(sport, {}))
         except Exception:
             pass
-    return {"model_confidence": 1.0, "edge_threshold_pct": 3.0,
-            "injury_penalty_pct": 5.0, "form_factor": 0.5, "odds_weight": 0.5}
+    return defaults
 
-def save_model_config(cfg: dict):
-    MODEL_CONFIG.write_text(json.dumps(cfg, indent=2))
+def save_sport_configs(cfgs: dict):
+    SPORT_CONFIG.write_text(json.dumps(cfgs, indent=2))
 
 
 # =============================================================================
@@ -1212,14 +1204,19 @@ def main():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    model_cfg    = load_model_config()
+    sport_cfgs   = load_sport_configs()
     bankroll_cfg = load_bankroll_config()
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.subheader("⚙️ Settings")
-        bankroll   = st.number_input("Bankroll (C$)", min_value=100.0, value=1500.0, step=100.0)
-        risk_level = st.radio("Kelly Risk Level", ["Safe","Moderate","Aggressive"], index=1)
+        bankroll = st.number_input("Bankroll (C$)", min_value=100.0,
+                                   value=float(bankroll_cfg.get("bankroll", 1500.0)), step=100.0)
+        bet_pct  = st.number_input("Bet % per trade", min_value=0.5, max_value=10.0,
+                                   value=float(bankroll_cfg.get("bet_pct", 2.0)), step=0.5,
+                                   help="Each qualifying bet = bankroll × this %")
+        st.caption(f"Stake per bet: **C${bankroll * bet_pct / 100:,.2f}**")
+        risk_level = "Moderate"   # kept for any legacy references
         st.divider()
 
         st.subheader("📡 Data Sources")
@@ -1265,12 +1262,12 @@ def main():
             prog.progress(20, text="🏀 Fetching NBA odds from Premium API…")
             df_nba_raw = fetch_premium_odds("basketball_nba")
             st.session_state["data_nba"] = calculate_stakes(
-                calculate_real_ev(df_nba_raw, model_cfg, "NBA"), bankroll, risk_level)
+                calculate_real_ev(df_nba_raw, sport_cfgs["NBA"], "NBA"), bankroll, bet_pct)
 
             prog.progress(50, text="⚾ Fetching MLB odds from Premium API…")
             df_mlb_raw = fetch_premium_odds("baseball_mlb")
             st.session_state["data_mlb"] = calculate_stakes(
-                calculate_real_ev(df_mlb_raw, model_cfg, "MLB"), bankroll, risk_level)
+                calculate_real_ev(df_mlb_raw, sport_cfgs["MLB"], "MLB"), bankroll, bet_pct)
 
             prog.progress(75, text="🎾 Fetching Tennis odds from Premium API…")
             df_atp_raw = fetch_premium_odds("tennis_atp")
@@ -1280,7 +1277,7 @@ def main():
             if not df_tennis_raw.empty:
                 df_tennis_raw = df_tennis_raw.drop_duplicates(subset=["Match", "_date"]).reset_index(drop=True)
             st.session_state["data_tennis"] = calculate_stakes(
-                calculate_real_ev(df_tennis_raw, model_cfg, "Tennis"), bankroll, risk_level)
+                calculate_real_ev(df_tennis_raw, sport_cfgs["Tennis"], "Tennis"), bankroll, bet_pct)
 
             st.session_state["data_fetched"] = today_str
             prog.progress(100, text="✅ Done!")
@@ -1307,26 +1304,6 @@ def main():
             st.session_state.pop(_sk, None)
         fetch_premium_odds.clear()
 
-    # Pipeline row counts in the UI
-    with st.expander("🔍 Pipeline counts (click to expand)", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("NBA rows after fetch",    len(df_nba))
-        c2.metric("MLB rows after fetch",    len(df_mlb))
-        c3.metric("Tennis rows after fetch", len(df_tennis))
-
-        # Show sample EV+/Edge values so we can see if model is generating signal
-        for label, df_s in [("NBA", df_nba), ("MLB", df_mlb), ("Tennis", df_tennis)]:
-            if df_s is not None and not df_s.empty and "EV+" in df_s.columns:
-                sample = df_s[["Match","Home Odds","Away Odds","EV+","Edge %"]].head(3)
-                st.markdown(f"**{label} — sample EV+ values:**")
-                st.dataframe(sample, hide_index=True, use_container_width=True)
-
-        # First raw event per sport so we can verify field names on the page
-        for label, sk in [("NBA","basketball_nba"), ("MLB","baseball_mlb"), ("Tennis","tennis_atp")]:
-            raw = st.session_state.get(f"debug_raw_event_{sk}")
-            if raw:
-                st.markdown(f"**{label} — first raw event from API:**")
-                st.json(raw)
     # ── END DEBUG ─────────────────────────────────────────────────────────────
 
     # Auto paper trade (only when data exists)
@@ -1376,19 +1353,12 @@ def main():
 
         if top8:
             for i, row in enumerate(top8):
-                h_col    = "Home Odds" if pd.notna(row.get("Home Odds")) else "P1 Odds"
-                a_col    = "Away Odds" if "Away Odds" in row.index else "P2 Odds"
-                h_odds   = float(row.get(h_col, 0) or 0)
-                a_odds   = float(row.get(a_col, 0) or 0)
-                home_t   = row.get("Home Team", row.get("Player 1",
-                           row.get("Match","? vs ?").split(" vs ")[0].strip()))
-                away_t   = row.get("Away Team", row.get("Player 2",
-                           row.get("Match","? vs ?").split(" vs ")[-1].strip()))
-                bet_team = home_t if h_odds <= a_odds else away_t
-                bet_odds = h_odds if h_odds <= a_odds else a_odds
-                stake    = float(row.get("Stake (C$)", 0) or 0)
-                ev       = float(row.get("EV+", 0) or 0)
-                edge     = float(row.get("Edge %", 0) or 0)
+                bet_team  = row.get("Rec Team", row.get("Match","?").split(" vs ")[0].strip())
+                bet_odds  = float(row.get("Rec Odds", 0) or 0)
+                stake     = float(row.get("Stake (C$)", 0) or 0)
+                ev        = float(row.get("EV+", 0) or 0)
+                edge      = float(row.get("Edge %", 0) or 0)
+                win_prob  = float(row.get("_ai_prob_raw", 0) or 0) * 100
                 sport_lbl = row.get("_sport", "")
                 game_date = row.get("_date", "")
                 game_time = row.get("Time/Score", "")
@@ -1405,6 +1375,8 @@ def main():
                     f"<div style='display:flex;gap:16px;flex-wrap:wrap;'>"
                     f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Odds</div>"
                     f"<div style='font-size:15px;font-weight:700;color:#00D9FF;'>{bet_odds:.2f}x</div></span>"
+                    f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Win Prob</div>"
+                    f"<div style='font-size:15px;font-weight:700;color:#a78bfa;'>{win_prob:.0f}%</div></span>"
                     f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Edge</div>"
                     f"<div style='font-size:15px;font-weight:700;color:#22c55e;'>{edge:+.2f}%</div></span>"
                     f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>EV+</div>"
@@ -1528,7 +1500,7 @@ def main():
         if cache_is_empty or pred_age is None or pred_age > 1800:
             with st.spinner(f"Fetching {pred_sport} games for next {days_ahead} days…"):
                 pred_df = build_advance_predictions(days_ahead, pred_sport,
-                                                    model_cfg, bankroll, risk_level)
+                                                    bankroll, bet_pct)
             st.session_state.pred_cache[cache_key]   = pred_df
             st.session_state.pred_fetched[fetched_key] = datetime.now()
         else:
@@ -1572,10 +1544,12 @@ def main():
                 ev_v       = float(dog.get("EV+", 0) or 0)
                 edge_v     = float(dog.get("Edge %", 0) or 0)
                 stake_v    = float(dog.get("Stake (C$)", 0) or 0)
+                win_prob_v = float(dog.get("_ai_prob_raw", 0) or 0) * 100
                 half_stake = round(stake_v * 0.5, 2)
                 payout_v   = round(half_stake * dog_odds, 2)
                 profit_v   = round(payout_v - half_stake, 2)
                 ev_color   = "#22c55e" if ev_v > 0 else "#ef4444"
+                prob_color = "#22c55e" if win_prob_v >= 35 else "#f59e0b" if win_prob_v >= 25 else "#ef4444"
                 st.markdown(
                     f'<div style="background:linear-gradient(135deg,#1a0a2e,#0f0a1e);border:2px solid #a855f7;'
                     f'border-radius:12px;padding:18px 22px;margin-bottom:14px;">'
@@ -1583,6 +1557,10 @@ def main():
                     f'🐶 Underdog Pick #{i+1} &nbsp;·&nbsp; {dog.get("_sport","")} &nbsp;·&nbsp; {dog.get("_date","")}</div>'
                     f'<div style="font-size:28px;font-weight:700;color:#e879f9;margin:6px 0;">{dog_team}</div>'
                     f'<div style="font-size:13px;color:#94a3b8;margin-bottom:10px;">vs {fav_team} &nbsp;·&nbsp; {dog.get("Match","")}</div>'
+                    f'<div style="background:#0f172a;border-radius:8px;padding:10px 14px;margin-bottom:10px;">'
+                    f'<span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Model Win Probability</span><br>'
+                    f'<span style="font-size:26px;font-weight:800;color:{prob_color};">{win_prob_v:.0f}%</span>'
+                    f'<span style="font-size:12px;color:#64748b;margin-left:8px;">chance of winning per model</span></div>'
                     f'<div style="font-size:13px;color:#e2e8f0;display:flex;gap:20px;flex-wrap:wrap;">'
                     f'<span>🎯 Odds: <b style="color:#e879f9;">{dog_odds:.2f}x</b></span>'
                     f'<span>📈 EV+: <b style="color:{ev_color};">{ev_v:+.4f}</b></span>'
@@ -1702,52 +1680,47 @@ def main():
 
     # ── TAB 8: Settings ───────────────────────────────────────────────────────
     with tabs[8]:
-        st.header("🔧 Advanced Settings")
-        s1, s2, s3 = st.tabs(["💰 Bankroll","🤖 Model","📊 Backtest"])
+        st.header("🔧 Settings")
+        s1, s2, s3 = st.tabs(["💰 Bankroll", "🏀⚾🎾 Sport Models", "📊 Backtest"])
 
         with s1:
-            st.subheader("💰 Bankroll Management")
-            c1,c2 = st.columns(2)
-            with c1:
-                br  = st.number_input("Starting Bankroll (C$)", min_value=100.0,
-                                      value=float(bankroll_cfg["starting_bankroll"]), step=100.0)
-                mn  = st.number_input("Min Stake (C$)", min_value=1.0,
-                                      value=float(bankroll_cfg["min_stake"]), step=1.0)
-            with c2:
-                mx  = st.number_input("Max Stake (C$)", min_value=10.0,
-                                      value=float(bankroll_cfg["max_stake"]), step=10.0)
-                mdd = st.slider("Max Drawdown %", 1, 50, int(bankroll_cfg["max_drawdown_pct"]))
-            kf = st.selectbox("Kelly Fraction", ["Safe (0.25x)","Moderate (0.50x)","Aggressive (0.75x)"], index=1)
+            st.subheader("💰 Bankroll")
+            st.info("Set your total bankroll and what % you want to bet on each qualifying play. "
+                    "Stake = Bankroll × Bet %.")
+            br_input  = st.number_input("Total Bankroll (C$)", min_value=100.0,
+                                        value=float(bankroll_cfg.get("bankroll", 1500.0)), step=100.0)
+            pct_input = st.number_input("Bet % per trade", min_value=0.5, max_value=10.0,
+                                        value=float(bankroll_cfg.get("bet_pct", 2.0)), step=0.5)
+            st.metric("Stake per qualifying bet", f"C${br_input * pct_input / 100:,.2f}")
             if st.button("💾 Save Bankroll"):
-                save_bankroll_config({"starting_bankroll":br,"min_stake":mn,
-                                      "max_stake":mx,"max_drawdown_pct":mdd,
-                                      "kelly_fraction":kf.split(" ")[0]})
-                st.success("✅ Saved.")
+                save_bankroll_config({"bankroll": br_input, "bet_pct": pct_input})
+                st.success("✅ Saved. Press Refresh Data to apply.")
 
         with s2:
-            st.subheader("🤖 Model Tuning")
-            st.info("Adjust how the AI calculates EV+ and edge. Changes apply immediately.")
-            c1,c2 = st.columns(2)
-            with c1:
-                mc = st.slider("Model Confidence", 0.5, 2.0,
-                               float(model_cfg["model_confidence"]), 0.05,
-                               help="1.0 = neutral. >1 = amplifies home advantage signal.")
-                et = st.slider("Edge Threshold %", 1, 10,
-                               int(model_cfg["edge_threshold_pct"]),
-                               help="Minimum edge vs bookmaker to flag a qualifying bet.")
-            with c2:
-                ip = st.slider("Injury Penalty %", 1, 20,
-                               int(model_cfg["injury_penalty_pct"]),
-                               help="Probability reduction for high-risk matches.")
-                ff = st.slider("Home Advantage Factor", 0.0, 1.0,
-                               float(model_cfg["form_factor"]), 0.05,
-                               help="Scale applied to sport-specific home advantage prior.")
-            ow = st.slider("Odds Weight", 0.0, 1.0, float(model_cfg["odds_weight"]), 0.05,
-                           help="How heavily the model leans on bookmaker consensus.")
-            if st.button("💾 Save Model"):
-                save_model_config({"model_confidence":mc,"edge_threshold_pct":et,
-                                   "injury_penalty_pct":ip,"form_factor":ff,"odds_weight":ow})
-                st.success("✅ Saved.")
+            st.subheader("Sport Model Settings")
+            st.info("Each sport uses its own confidence and injury penalty. "
+                    "Changes apply on next Refresh Data.")
+            _cfgs = load_sport_configs()
+            sport_tabs = st.tabs(["🏀 NBA", "⚾ MLB", "🎾 Tennis"])
+            sport_keys = ["NBA", "MLB", "Tennis"]
+            new_cfgs   = {}
+            for st_tab, sk in zip(sport_tabs, sport_keys):
+                with st_tab:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        mc = st.slider(f"{sk} Model Confidence", 0.5, 1.5,
+                                       float(_cfgs[sk]["model_confidence"]), 0.05,
+                                       key=f"mc_{sk}",
+                                       help="1.0 = neutral. >1 trusts the boost more.")
+                    with c2:
+                        ip = st.slider(f"{sk} Injury Penalty %", 1, 15,
+                                       int(_cfgs[sk]["injury_penalty_pct"]),
+                                       key=f"ip_{sk}",
+                                       help="Probability cut when Risk Meter is high.")
+                    new_cfgs[sk] = {"model_confidence": mc, "injury_penalty_pct": ip}
+            if st.button("💾 Save Sport Settings"):
+                save_sport_configs(new_cfgs)
+                st.success("✅ Saved. Press Refresh Data to apply.")
 
         with s3:
             st.subheader("📊 Backtest")
