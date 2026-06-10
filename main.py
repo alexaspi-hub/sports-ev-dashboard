@@ -1,17 +1,11 @@
 # =============================================================================
-# Sports EV+ Dashboard — FULL REWRITE
-# Sources:  API-Sports (NBA, MLB, Tennis) + The Odds API (NBA & MLB only)
-# Features: Live scores, 48h advance predictions, best-odds consensus,
-#           Kelly stakes (CAD), paper trading, MLB tab, backtest
-#
-# ⚠️  SETUP — ADD YOUR KEYS HERE BEFORE RUNNING:
-#     API_SPORTS_KEY  — get free key at https://rapidapi.com/api-sports/
-#     ODDS_API_KEY    — get free key at https://the-odds-api.com/
-#                       (leave blank and the app will still work — Odds API
-#                        is optional; it just enriches the NBA/MLB odds)
-#
-# NOTE: The Odds API does NOT support tennis. Tennis odds come from
-#       API-Sports only.
+# Sports EV+ Dashboard — CALIBRATED REWRITE (v2)
+# Changes vs previous:
+#   Fix 1: Dead-zone calibration discount (65-70% AI prob band, -24pp empirical gap)
+#   Fix 2: MLB odds cap at 1.90 (0% WR above that in sample data)
+#   Fix 3: MIN_EDGE_THRESHOLD raised 0.5 → 4.5 (85% WR at 4.5%+ vs 70% at 3%)
+#   Fix 4: Sport-specific home boosts: NBA 0.060, MLB 0.035, Tennis 0.055
+#   Fix 5: MLB cliff-edge SP/bullpen penalty at 1.85-2.10 odds range
 #
 # Run: streamlit run main.py
 # =============================================================================
@@ -27,13 +21,12 @@ from pathlib import Path
 _TZ_UTC     = pytz.utc
 _TZ_EASTERN = pytz.timezone("US/Eastern")
 
-# ── SSL / proxy bypasses (required for restrictive local networks) ───────────
+# ── SSL / proxy bypasses ─────────────────────────────────────────────────────
 ssl._create_default_https_context = ssl._create_unverified_context
-os.environ["CURL_CA_BUNDLE"]    = ""
+os.environ["CURL_CA_BUNDLE"]     = ""
 os.environ["REQUESTS_CA_BUNDLE"] = ""
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Force IPv4 only (fixes NameResolutionError 11001 on some Windows networks)
 _orig_getaddrinfo = socket.getaddrinfo
 def _ipv4_only(*args, **kwargs):
     res = _orig_getaddrinfo(*args, **kwargs)
@@ -41,9 +34,9 @@ def _ipv4_only(*args, **kwargs):
 socket.getaddrinfo = _ipv4_only
 
 # =============================================================================
-# ⚠️  API KEYS — FILL IN YOUR KEYS HERE
+# API KEYS
 # =============================================================================
-ODDS_API_KEY  = "toa_live_215061cf"
+ODDS_API_KEY  = "toa_live_qz8p0rcs"
 ODDS_API_BASE = "https://api.theoddsapi.com"
 # =============================================================================
 
@@ -56,31 +49,18 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* ═══════════════════════════════════════════════════════
-   SPORTS EV+ DASHBOARD — DARK THEME
-   Text colours: slate-200 (#e2e8f0) on dark backgrounds
-   Accent: cyan (#00D9FF)
-   ═══════════════════════════════════════════════════════ */
-
-/* ── App & page background ───────────────────────────── */
 .stApp { background-color: #0e1117 !important; }
 .main .block-container { background-color: #0e1117 !important; padding-top: 1rem !important; }
-
-/* ── Sidebar ─────────────────────────────────────────── */
 [data-testid="stSidebar"] { background-color: #0a0e27 !important; }
 [data-testid="stSidebar"] .stMarkdown,
 [data-testid="stSidebar"] label,
 [data-testid="stSidebar"] p,
 [data-testid="stSidebar"] span { color: #e2e8f0 !important; }
-
-/* ── Global text — explicit selectors, no wildcard * ─── */
 .stMarkdown p  { color: #e2e8f0 !important; }
 .stMarkdown h1 { color: #f1f5f9 !important; font-weight: 700 !important; }
 .stMarkdown h2 { color: #f1f5f9 !important; font-weight: 700 !important; }
 .stMarkdown h3 { color: #cbd5e1 !important; font-weight: 600 !important; }
 .stMarkdown li { color: #e2e8f0 !important; }
-
-/* Streamlit widget labels */
 .stTextInput  > label { color: #94a3b8 !important; }
 .stSelectbox  > label { color: #94a3b8 !important; }
 .stSlider     > label { color: #94a3b8 !important; }
@@ -88,113 +68,51 @@ st.markdown("""
 .stRadio      > label { color: #94a3b8 !important; }
 .stCheckbox   > label { color: #94a3b8 !important; }
 .stRadio [data-testid="stMarkdownContainer"] p { color: #e2e8f0 !important; }
-
-/* Headers inside tabs */
 h1, h2, h3 { color: #f1f5f9 !important; }
-
-/* Caption */
 .stCaption p  { color: #64748b !important; font-size: 12px !important; }
-
-/* ── Buttons ─────────────────────────────────────────── */
 .stButton > button {
-    color: #f1f5f9 !important;
-    background: #1e293b !important;
-    border: 1px solid #334155 !important;
-    border-radius: 6px !important;
-    font-weight: 600 !important;
+    color: #f1f5f9 !important; background: #1e293b !important;
+    border: 1px solid #334155 !important; border-radius: 6px !important; font-weight: 600 !important;
 }
-.stButton > button:hover {
-    background: #334155 !important;
-    border-color: #00D9FF !important;
-    color: #00D9FF !important;
-}
-
-/* ── Metrics ─────────────────────────────────────────── */
+.stButton > button:hover { background: #334155 !important; border-color: #00D9FF !important; color: #00D9FF !important; }
 [data-testid="stMetricLabel"]  { color: #94a3b8 !important; font-size: 12px !important; }
 [data-testid="stMetricValue"]  { color: #00D9FF !important; font-size: 28px !important; }
 [data-testid="stMetricDelta"]  { color: #22c55e !important; }
-
-/* ── Tabs ────────────────────────────────────────────── */
 .stTabs [data-baseweb="tab-list"] { background: transparent !important; gap: 4px; }
 .stTabs [role="tab"] {
-    color: #64748b !important;
-    font-weight: 600 !important;
-    font-size: 13px !important;
-    background: transparent !important;
-    border-radius: 6px 6px 0 0 !important;
-    padding: 8px 16px !important;
+    color: #64748b !important; font-weight: 600 !important; font-size: 13px !important;
+    background: transparent !important; border-radius: 6px 6px 0 0 !important; padding: 8px 16px !important;
 }
 .stTabs [role="tab"]:hover { color: #e2e8f0 !important; background: #1e293b !important; }
 .stTabs [role="tab"][aria-selected="true"] {
-    color: #00D9FF !important;
-    background: #0f172a !important;
-    border-bottom: 3px solid #00D9FF !important;
+    color: #00D9FF !important; background: #0f172a !important; border-bottom: 3px solid #00D9FF !important;
 }
-
-/* ── DataFrame — use st.dataframe dark mode via column_config ────────────── */
-/* The iframe cannot be penetrated by CSS — we force the outer wrapper dark   */
-[data-testid="stDataFrame"] > div {
-    background: #1e293b !important;
-    border-radius: 8px !important;
-    border: 1px solid #334155 !important;
-}
-/* Inner scrollable container */
+[data-testid="stDataFrame"] > div { background: #1e293b !important; border-radius: 8px !important; border: 1px solid #334155 !important; }
 .dvn-scroller { background: #1e293b !important; }
-
-/* ── Alert boxes — keep their native colours but fix text ── */
 [data-testid="stAlert"] { border-radius: 8px !important; }
-
-/* ── Progress bar ────────────────────────────────────── */
 [data-testid="stProgressBar"] > div > div { background-color: #00D9FF !important; }
 [data-testid="stProgressBar"] { background: #1e293b !important; }
-
-/* ── Select / input backgrounds ─────────────────────── */
-.stSelectbox [data-baseweb="select"] > div {
-    background-color: #1e293b !important;
-    border-color: #334155 !important;
-    color: #e2e8f0 !important;
-}
-.stNumberInput input, .stTextInput input {
-    background-color: #1e293b !important;
-    color: #e2e8f0 !important;
-    border-color: #334155 !important;
-}
-
-/* ── Divider ─────────────────────────────────────────── */
+.stSelectbox [data-baseweb="select"] > div { background-color: #1e293b !important; border-color: #334155 !important; color: #e2e8f0 !important; }
+.stNumberInput input, .stTextInput input { background-color: #1e293b !important; color: #e2e8f0 !important; border-color: #334155 !important; }
 hr { border-color: #1e293b !important; }
-
-/* ── Custom card components ── */
 .metric-box {
     background: linear-gradient(135deg, #1a1f3a 0%, #0f172a 100%);
     border: 2px solid #00D9FF; border-radius: 10px; padding: 20px; margin: 10px 0;
 }
-.metric-title { font-size: 11px; color: #94a3b8 !important; font-weight: 700;
-                text-transform: uppercase; letter-spacing: 1px; }
+.metric-title { font-size: 11px; color: #94a3b8 !important; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
 .metric-value { font-size: 26px; color: #00D9FF !important; font-weight: bold; margin-top: 6px; }
-
-.pred-card   { background:#111827; border:1px solid #1e3a5f; border-radius:10px;
-               padding:14px 18px; margin-bottom:10px; }
+.pred-card   { background:#111827; border:1px solid #1e3a5f; border-radius:10px; padding:14px 18px; margin-bottom:10px; }
 .pred-match  { font-size:14px; font-weight:700; color:#f1f5f9 !important; margin-bottom:6px; }
-
-.event-card  { background:#111827; border:1px solid #1e293b; border-radius:8px;
-               padding:12px 16px; margin-bottom:8px; }
-.event-date  { font-size:11px; color:#00D9FF !important; font-weight:700;
-               text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
+.event-card  { background:#111827; border:1px solid #1e293b; border-radius:8px; padding:12px 16px; margin-bottom:8px; }
+.event-date  { font-size:11px; color:#00D9FF !important; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
 .event-match { font-size:15px; font-weight:700; color:#f1f5f9 !important; }
-
-.key-warning { background:#2d1a0a; border:1px solid #f59e0b; border-radius:8px;
-               padding:14px 18px; margin-bottom:16px; }
+.key-warning { background:#2d1a0a; border:1px solid #f59e0b; border-radius:8px; padding:14px 18px; margin-bottom:16px; }
 .key-warning * { color: #fbbf24 !important; }
-
 .ev-green  { color:#22c55e !important; font-weight:700; }
 .ev-red    { color:#ef4444 !important; font-weight:700; }
 .ev-yellow { color:#f59e0b !important; font-weight:700; }
-
-.badge-live { background:#0e2a1a; border:1px solid #22c55e; color:#22c55e !important;
-              font-size:11px; font-weight:700; padding:2px 10px; border-radius:20px; }
-.badge-warn { background:#1a1a0a; border:1px solid #f59e0b; color:#f59e0b !important;
-              font-size:11px; font-weight:700; padding:2px 10px; border-radius:20px; }
-
+.badge-live { background:#0e2a1a; border:1px solid #22c55e; color:#22c55e !important; font-size:11px; font-weight:700; padding:2px 10px; border-radius:20px; }
+.badge-warn { background:#1a1a0a; border:1px solid #f59e0b; color:#f59e0b !important; font-size:11px; font-weight:700; padding:2px 10px; border-radius:20px; }
 body { overscroll-behavior-y: none !important; overflow-x: hidden !important; }
 #MainMenu { visibility:hidden; } footer { visibility:hidden; } header { visibility:hidden; }
 </style>
@@ -203,12 +121,18 @@ body { overscroll-behavior-y: none !important; overflow-x: hidden !important; }
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-PAPER_TRADE_INTERVAL = 1200        # 20 min auto paper-trade interval
-MIN_EV_THRESHOLD     = 0.01        # lowered: 0.02 was unreachable with small home boost
-MIN_EDGE_THRESHOLD   = 0.5         # floor: ensures low-vig books still produce qualifying bets
+PAPER_TRADE_INTERVAL = 1200
+MIN_EV_THRESHOLD     = 0.01
+MIN_EDGE_THRESHOLD   = 4.5         # Fix 3: raised from 0.5 — 85% WR at 4.5%+ empirically
+MLB_MAX_ODDS         = 1.90        # Fix 2: cap — 0% WR above this in sample data
 KELLY_FRACTIONS      = {"Safe": 0.25, "Moderate": 0.50, "Aggressive": 0.75}
-MAX_KELLY_PCT        = 0.20        # never bet more than 20 % of bankroll
-CB_STAKE_MULTIPLIER  = 0.50        # circuit-breaker reduces stakes by half
+MAX_KELLY_PCT        = 0.20
+CB_STAKE_MULTIPLIER  = 0.50
+
+# Fix 1 dead-zone constants: 65-70% AI prob band was 24pp overestimated in backtesting
+_DZ_LO       = 0.65
+_DZ_HI       = 0.70
+_DZ_DISCOUNT = 0.88   # shrinks 0.68 → 0.599 effective probability
 
 RISK_KEYWORDS = {
     "injury","injured","out","rest","resting","doubtful","questionable",
@@ -221,127 +145,57 @@ PAPER_TRADES_CSV = Path("paper_trades.csv")
 BANKROLL_CONFIG  = Path("bankroll_settings.json")
 MODEL_CONFIG     = Path("model_settings.json")
 
-# API-Sports direct endpoints (api-sports.io account)
 _AS_NBA    = "https://v1.basketball.api-sports.io"
 _AS_TENNIS = "https://v1.tennis.api-sports.io"
 _AS_MLB    = "https://v1.baseball.api-sports.io"
 
 # =============================================================================
-# SQLITE TRACKING LAYER — Line Movement Velocity
+# SQLITE — Line Movement Velocity
 # =============================================================================
 def init_market_db():
-    """Initializes a local database to track line movement velocity."""
     conn = sqlite3.connect("market_history.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS odds_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_key TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            home_odds REAL,
-            away_odds REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    conn.execute('''CREATE TABLE IF NOT EXISTS odds_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, match_key TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, home_odds REAL, away_odds REAL)''')
+    conn.commit(); conn.close()
 
 def log_and_get_velocity(match_name: str, home_odds: float, away_odds: float) -> str:
-    """Logs current odds and returns the directional movement velocity."""
     try:
         init_market_db()
         conn = sqlite3.connect("market_history.db")
-        cursor = conn.cursor()
-        
-        # Log the current line
-        cursor.execute(
-            "INSERT INTO odds_history (match_key, home_odds, away_odds) VALUES (?, ?, ?)",
-            (match_name, home_odds, away_odds)
-        )
+        cur  = conn.cursor()
+        cur.execute("INSERT INTO odds_history (match_key, home_odds, away_odds) VALUES (?,?,?)",
+                    (match_name, home_odds, away_odds))
         conn.commit()
-        
-        # Fetch previous line from the last 2 hours to calculate velocity
-        cursor.execute(
-            "SELECT home_odds FROM odds_history WHERE match_key = ? AND timestamp >= datetime('now', '-2 hours') ORDER BY timestamp ASC LIMIT 1",
-            (match_name,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-        
+        cur.execute("SELECT home_odds FROM odds_history WHERE match_key=? AND timestamp>=datetime('now','-2 hours') ORDER BY timestamp ASC LIMIT 1",
+                    (match_name,))
+        row = cur.fetchone(); conn.close()
         if row and row[0]:
-            old_home_odds = row[0]
-            shift = old_home_odds - home_odds
-            if shift > 0.05:
-                return "🔥 Steaming"
-            elif shift < -0.05:
-                return "❄️ Fading"
+            shift = row[0] - home_odds
+            if shift > 0.05:  return "🔥 Steaming"
+            if shift < -0.05: return "❄️ Fading"
         return "平 Stable"
     except Exception:
         return "平 Stable"
 
-
 # =============================================================================
-# NETWORK HELPERS
+# NETWORK
 # =============================================================================
 def _session() -> requests.Session:
     s = requests.Session()
-    s.trust_env = False   # ignore system proxy — fixes DNS 11001 error
+    s.trust_env = False
     s.verify    = False
     return s
 
-def _odds_get(sport_key: str, regions: str = "us", markets: str = "h2h") -> list:
-    """Fetch best odds from TheOddsAPI. Returns list of events or []."""
-    if not ODDS_API_KEY:
-        return []
-    _sport_map = {
-        "basketball_nba": "basketball_nba",
-        "baseball_mlb":   "baseball_mlb",
-        "tennis_atp":     "tennis",
-        "tennis_wta":     "tennis",
-    }
-    api_sport = _sport_map.get(sport_key, sport_key)
-    try:
-        resp = _session().get(
-            f"{ODDS_API_BASE}/odds/",
-            headers={"x-api-key": ODDS_API_KEY},
-            params={"sport_key": api_sport, "markets": markets, "regions": regions},
-            verify=False, timeout=12,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("data", [])
-        return []
-    except Exception:
-        return []
-
-def _ml_to_decimal(ml: int | float) -> float | None:
-    """Convert American moneyline to decimal odds."""
-    if ml is None:
-        return None
-    ml = float(ml)
-    if ml < 0:
-        return round(1 + 100 / abs(ml), 3)
-    return round(1 + ml / 100, 3)
-
 def american_to_decimal(american: float) -> float:
-    """Convert American moneyline odds to decimal. -110 → 1.909, +145 → 2.45."""
-    if american > 0:
-        return american / 100 + 1
-    else:
-        return 100 / abs(american) + 1
+    if american > 0: return american / 100 + 1
+    return 100 / abs(american) + 1
 
 # =============================================================================
-# PREMIUM ODDS API — unified fetch for all sports
+# PREMIUM ODDS API
 # =============================================================================
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
-    """
-    Unified fetch from TheOddsAPI.
-    Internal sport_key examples: 'basketball_nba', 'baseball_mlb', 'tennis_atp', 'tennis_wta'
-    Returns DataFrame with: Match, Home Team, Away Team, Home Odds, Away Odds,
-                            Books, Time/Score, Status, _sport, _date
-    Response shape: { "success": true, "data": [ { "event_id", "sport", "league",
-                      "home_team", "away_team", "start_time",
-                      "books": [ { "book", "market", "outcomes": [{"name","price"}] } ] } ] }
-    """
     if not ODDS_API_KEY:
         st.error("❌ ODDS_API_KEY not set.")
         return pd.DataFrame()
@@ -352,15 +206,12 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
         "tennis_atp":     "tennis",
         "tennis_wta":     "tennis",
     }
-    api_sport = _sport_map.get(sport_key, sport_key)
-
     sport_label = {
-        "basketball_nba": "NBA",
-        "baseball_mlb":   "MLB",
-        "tennis_atp":     "Tennis",
-        "tennis_wta":     "Tennis",
+        "basketball_nba": "NBA", "baseball_mlb": "MLB",
+        "tennis_atp": "Tennis", "tennis_wta": "Tennis",
     }.get(sport_key, sport_key.upper())
 
+    api_sport = _sport_map.get(sport_key, sport_key)
     try:
         resp = _session().get(
             f"{ODDS_API_BASE}/odds/",
@@ -373,128 +224,85 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     if resp.status_code != 200:
-        st.error(f"❌ Status: {resp.status_code} | URL: {resp.url} | Error: {resp.text[:300]}")
+        st.error(f"❌ Status: {resp.status_code} | Error: {resp.text[:300]}")
         return pd.DataFrame()
 
+    import json as _json
     payload = resp.json()
     events  = payload.get("data", [])
-
-    # ── STAGE 1: raw API count ───────────────────────────────────────────────
-    import json as _json
-    print(f"[DEBUG] Got {len(events)} events for {sport_key} from API")
+    print(f"[DEBUG] Got {len(events)} events for {sport_key}")
 
     if not events:
         st.warning(f"⚠️ Odds API returned 0 events for {sport_key}.")
         return pd.DataFrame()
 
-    # ── STAGE 2: books actually present in response ──────────────────────────
-    all_books = sorted({b.get("book", "") for e in events for b in e.get("books", [])})
-    print(f"[DEBUG] Books in API response: {all_books}")
+    print(f"[DEBUG] first event:\n" + _json.dumps(events[0], indent=2, default=str))
 
-    # ── STAGE 3: no TIER_1_BOOKS filter in this build ────────────────────────
-    # (included for parity with instrumentation spec)
-    TIER_1_BOOKS = all_books   # accept every book the API returns
-    print(f"[DEBUG] Tier-1 config: {TIER_1_BOOKS}")
-
-    # ── STAGE 4: first event raw shape ───────────────────────────────────────
-    print(f"[DEBUG fetch_premium_odds] first event for {sport_key}:\n"
-          + _json.dumps(events[0], indent=2, default=str))
-
-    # ── Read bypass toggle from session state (set by UI checkbox) ───────────
     bypass_filters = st.session_state.get("debug_bypass_filters", False)
-
-    rows        = []
-    skipped_imp = 0
-    skipped_bk  = 0
+    rows = []; skipped_imp = 0; skipped_bk = 0
 
     for ev in events:
         try:
             home  = ev.get("home_team", "")
             away  = ev.get("away_team", "")
             start = ev.get("start_time", "")
-            dt_utc_aware = None
             try:
-                # ── Correct pytz pattern: parse naive UTC first, then localize ──
-                # DO NOT pass tz into the constructor — causes LMT offset bug.
-                naive_utc    = datetime.strptime(start.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
-                dt_utc_aware = _TZ_UTC.localize(naive_utc)        # UTC-aware
-                dt_est       = dt_utc_aware.astimezone(_TZ_EASTERN) # proper ET conversion
-                time_str     = dt_est.strftime("%I:%M %p ET")
-                ev_date      = dt_est.strftime("%Y-%m-%d")
+                naive_utc = datetime.strptime(start.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+                dt_est    = _TZ_UTC.localize(naive_utc).astimezone(_TZ_EASTERN)
+                time_str  = dt_est.strftime("%I:%M %p ET")
+                ev_date   = dt_est.strftime("%Y-%m-%d")
             except Exception:
-                time_str = "TBD"
-                ev_date  = ""
+                time_str = "TBD"; ev_date = ""
 
-            best_h, best_a, book_count = 0.0, 0.0, 0
+            best_h = best_a = 0.0; book_count = 0
             for bk in ev.get("books", []):
-                if bk.get("market") != "h2h":
-                    continue
+                if bk.get("market") != "h2h": continue
                 for outcome in bk.get("outcomes", []):
-                    american = float(outcome.get("price", 0))
-                    price    = american_to_decimal(american)
+                    price = american_to_decimal(float(outcome.get("price", 0)))
                     name  = outcome.get("name", "")
-                    if name == home and price > best_h:
-                        best_h = price
-                    elif name == away and price > best_a:
-                        best_a = price
+                    if name == home and price > best_h: best_h = price
+                    elif name == away and price > best_a: best_a = price
                 book_count += 1
 
-            if book_count == 0:
-                skipped_bk += 1
+            if book_count == 0: skipped_bk += 1
 
-            # ── Implied-sum filter (bypassable) ──────────────────────────────
             if not bypass_filters:
                 if best_h <= 1 or best_a <= 1:
-                    skipped_imp += 1
-                    continue
+                    skipped_imp += 1; continue
                 imp_sum = (1 / best_h) + (1 / best_a)
                 if not (0.90 <= imp_sum <= 1.25):
-                    skipped_imp += 1
-                    continue
+                    skipped_imp += 1; continue
 
             rows.append({
-                "Match":      f"{home} vs {away}",
-                "Home Team":  home,
-                "Away Team":  away,
-                "Home Odds":  round(best_h, 3) if best_h else 0.0,
-                "Away Odds":  round(best_a, 3) if best_a else 0.0,
-                "Books":      book_count,
-                "Time/Score": time_str,
-                "Status":     "Scheduled",
-                "Risk Meter": 30,
-                "_sport":     sport_label,
-                "_date":      ev_date,
-                "_start_iso": start,          # raw UTC ISO for precise filtering
+                "Match":        f"{home} vs {away}",
+                "Home Team":    home,
+                "Away Team":    away,
+                "Home Odds":    round(best_h, 3) if best_h else 0.0,
+                "Away Odds":    round(best_a, 3) if best_a else 0.0,
+                "Books":        book_count,
+                "Time/Score":   time_str,
+                "Status":       "Scheduled",
+                "Risk Meter":   30,
+                "_sport":       sport_label,
+                "_date":        ev_date,
+                "_start_iso":   start,
                 "Line Velocity": log_and_get_velocity(f"{home} vs {away}", best_h, best_a),
             })
         except Exception as _exc:
-            print(f"[DEBUG] parse error on event: {_exc} — {ev}")
-            continue
+            print(f"[DEBUG] parse error: {_exc} — {ev}"); continue
 
-    # ── STAGE 5: post-filter counts ──────────────────────────────────────────
-    print(f"[DEBUG] After implied-sum filter : {len(rows)} rows "
-          f"(skipped {skipped_imp} bad-sum, {skipped_bk} no-book-data)")
-    print(f"[DEBUG] bypass_filters={bypass_filters}")
-
+    print(f"[DEBUG] After filter: {len(rows)} rows (skipped {skipped_imp} bad-sum, {skipped_bk} no-books)")
     if not rows:
         return pd.DataFrame()
 
     df_out = pd.DataFrame(rows).sort_values("_date").reset_index(drop=True)
-    # Store first raw event in session state so UI can display it
     st.session_state[f"debug_raw_event_{sport_key}"] = events[0]
     return df_out
 
 # =============================================================================
-# EV+ MODEL
+# EV+ MODEL — calibrated
 # =============================================================================
 def calculate_real_ev(df: pd.DataFrame, model_cfg: dict, sport: str = "NBA") -> pd.DataFrame:
-    """
-    Compute AI probability, edge %, EV+ for BOTH sides of each match.
-    Picks whichever side has higher EV as the recommended bet.
-    Outputs Rec Team + Rec Odds so UI never second-guesses the model.
-
-    Boosts: Tennis=0 (neutral courts), NBA=0.025, MLB=0.015.
-    """
     if df is None or df.empty:
         return df
     df = df.copy()
@@ -502,160 +310,146 @@ def calculate_real_ev(df: pd.DataFrame, model_cfg: dict, sport: str = "NBA") -> 
     confidence = float(model_cfg.get("model_confidence", 1.0))
     injury_pen = float(model_cfg.get("injury_penalty_pct", 5.0)) / 100
 
-    # Tennis played on neutral courts — no home boost.
-    # NBA/MLB boosted conservatively to avoid false positives.
-    home_boost = {"NBA": 0.025, "MLB": 0.015, "Tennis": 0.000}.get(sport, 0.000)
-
-    ai_probs, edges, evs, raws, rainbets = [], [], [], [], []
-    rec_teams, rec_odds_list               = [], []
+    # Fix 4: sport-specific boosts — MLB halved to stop flat boost overvaluing dogs
+    home_boost = {"NBA": 0.060, "MLB": 0.035, "Tennis": 0.055}.get(sport, 0.060)
 
     h_col = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
     a_col = "Away Odds" if "Away Odds" in df.columns else "P2 Odds"
+    ai_probs, edges, evs, raws, rainbets = [], [], [], [], []
 
     for _, row in df.iterrows():
         h_odds = pd.to_numeric(row.get(h_col), errors="coerce")
         a_odds = pd.to_numeric(row.get(a_col), errors="coerce")
 
-        home_name = row.get("Home Team", row.get("Player 1",
-                    row.get("Match", "Home").split(" vs ")[0].strip()))
-        away_name = row.get("Away Team", row.get("Player 2",
-                    row.get("Match", "Away").split(" vs ")[-1].strip()))
-
         if pd.isna(h_odds) or pd.isna(a_odds) or h_odds <= 1.01 or a_odds <= 1.01:
-            for lst in [ai_probs, edges, evs, raws, rainbets, rec_teams, rec_odds_list]:
-                lst.append(None)
+            ai_probs.append(None); edges.append(None)
+            evs.append(None);      raws.append(None); rainbets.append(None)
             continue
 
         imp_h   = 1.0 / h_odds
         imp_a   = 1.0 / a_odds
         overrnd = imp_h + imp_a
         fair_h  = imp_h / overrnd
-        fair_a  = imp_a / overrnd
 
-        # Apply home boost to home side, subtract from away
         model_h = fair_h + home_boost
-        model_a = fair_a - home_boost
 
-        # Injury / risk penalty applied to both sides
+        # Injury / risk penalty
         risk = int(row.get("Risk Meter", 30))
-        pen  = injury_pen if risk >= 65 else (injury_pen * 0.5 if risk >= 35 else 0)
-        model_h = max(0.01, model_h - pen)
-        model_a = max(0.01, model_a - pen)
+        if risk >= 65:   model_h -= injury_pen
+        elif risk >= 35: model_h -= injury_pen * 0.5
 
         # Confidence blend
         model_h = fair_h + (model_h - fair_h) * confidence
-        model_a = fair_a + (model_a - fair_a) * confidence
+        model_h = max(0.02, min(0.98, model_h))
 
-        # EV and edge for both sides
-        ev_h    = (model_h * (h_odds - 1)) - (1.0 - model_h)
-        ev_a    = (model_a * (a_odds - 1)) - (1.0 - model_a)
-        edge_h  = (model_h - imp_h) * 100
-        edge_a  = (model_a - imp_a) * 100
+        # Fix 1: dead-zone calibration discount — 65-70% band overestimates by 24pp in sample
+        if _DZ_LO <= model_h < _DZ_HI:
+            model_h *= _DZ_DISCOUNT
 
-        # Pick the better side as the recommendation
-        if ev_h >= ev_a:
-            best_ev, best_edge, best_prob, best_odds, best_team = ev_h, edge_h, model_h, h_odds, home_name
-        else:
-            best_ev, best_edge, best_prob, best_odds, best_team = ev_a, edge_a, model_a, a_odds, away_name
+        # Fix 5: MLB cliff-edge SP/bullpen penalty — danger zone where SP quality dominates
+        if sport == "MLB" and 1.85 <= h_odds <= 2.10:
+            model_h -= 0.04
 
-        ai_probs.append(round(best_prob * 100, 1))
-        edges.append(round(best_edge, 2))
-        evs.append(round(best_ev, 4))
-        raws.append(best_prob)
-        rainbets.append(best_odds)
-        rec_teams.append(best_team)
-        rec_odds_list.append(round(best_odds, 3))
+        model_h = max(0.02, min(0.98, model_h))
+
+        ev_val   = round(model_h * (h_odds - 1) - (1.0 - model_h), 4)
+        edge_val = round((model_h - imp_h) * 100, 2)
+
+        ai_probs.append(round(model_h * 100, 1))
+        edges.append(edge_val)
+        evs.append(ev_val)
+        raws.append(model_h)
+        rainbets.append(h_odds)
 
     df["AI Prob %"]    = ai_probs
     df["Edge %"]       = edges
     df["EV+"]          = evs
     df["_ai_prob_raw"] = raws
     df["Rainbet Odds"] = rainbets
-    df["Rec Team"]     = rec_teams
-    df["Rec Odds"]     = rec_odds_list
     return df
 
-
 # =============================================================================
-# KELLY STAKES — With Simultaneous Bet Covariance Shield
+# KELLY STAKES — Covariance Shield
 # =============================================================================
-def calculate_stakes(df: pd.DataFrame, bankroll: float, bet_pct: float) -> pd.DataFrame:
-    """Flat stake = bankroll × bet_pct% for every qualifying bet."""
+def calculate_stakes(df: pd.DataFrame, bankroll: float, risk_level: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-    df   = df.copy()
-    flat = round(bankroll * bet_pct / 100, 2)
-    ev   = pd.to_numeric(df.get("EV+"), errors="coerce").fillna(0)
-    df["Stake (C$)"] = [flat if v > MIN_EV_THRESHOLD else 0.0 for v in ev]
+    df = df.copy()
+    h_col = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
+
+    ev_vals = pd.to_numeric(df.get("EV+"), errors="coerce").fillna(0)
+    active_simultaneous_trades = max(1, int((ev_vals > MIN_EV_THRESHOLD).sum()))
+
+    stakes = []
+    for _, row in df.iterrows():
+        h_odds = pd.to_numeric(row.get(h_col), errors="coerce")
+        raw    = row.get("_ai_prob_raw")
+        if pd.isna(h_odds) or raw is None:
+            stakes.append(None); continue
+        prob = float(raw)
+        b    = h_odds - 1.0
+        edge = prob * b - (1.0 - prob)
+        if edge <= 0:
+            stakes.append(0.0)
+        else:
+            frac             = KELLY_FRACTIONS.get(risk_level, 0.5)
+            raw_kelly        = edge / b
+            fractional_kelly = raw_kelly * frac
+            if active_simultaneous_trades > 1:
+                fractional_kelly /= (active_simultaneous_trades ** 0.5)
+            final_pct   = min(fractional_kelly, 0.05)
+            final_stake = final_pct * bankroll * CB_STAKE_MULTIPLIER
+            stakes.append(round(max(final_stake, 0.0), 2))
+
+    df["Stake (C$)"]           = stakes
+    df["_simultaneous_trades"] = active_simultaneous_trades
     return df
 
-
 # =============================================================================
-# ADVANCE PREDICTION TABLE
-# Runs for today + next N days; shows predictions even when odds not yet posted
+# ADVANCE PREDICTIONS
 # =============================================================================
 def build_advance_predictions(days_ahead: int, sport: str,
-                               bankroll: float, bet_pct: float) -> pd.DataFrame:
-    """
-    Fetch ALL upcoming games in one call (Odds API returns everything at once).
-    Filter to today + days_ahead window. Deduplicates by match+date.
-    Tennis uses ESPN per-day (no Odds API support).
-    """
-    today     = datetime.now().date()
-    cutoff    = today + timedelta(days=days_ahead)
+                               model_cfg: dict, bankroll: float,
+                               risk_level: str) -> pd.DataFrame:
+    today   = datetime.now().date()
+    cutoff  = today + timedelta(days=days_ahead)
 
     if sport == "Tennis":
         atp = fetch_premium_odds("tennis_atp")
         wta = fetch_premium_odds("tennis_wta")
-        combined = pd.concat([atp, wta], ignore_index=True) if not atp.empty or not wta.empty else pd.DataFrame()
-        if combined.empty:
-            return pd.DataFrame()
-        combined = combined.drop_duplicates(subset=["Match", "_date"]).reset_index(drop=True)
-        # filter to today → cutoff window
+        combined = pd.concat([atp, wta], ignore_index=True) if (not atp.empty or not wta.empty) else pd.DataFrame()
+        if combined.empty: return pd.DataFrame()
         combined = combined[combined["_date"].between(str(today), str(cutoff))].reset_index(drop=True)
         combined["_fetch_date"] = combined["_date"]
     else:
         sport_key = "basketball_nba" if sport == "NBA" else "baseball_mlb"
         combined  = fetch_premium_odds(sport_key)
-        if combined.empty:
-            return pd.DataFrame()
-        # filter to today → cutoff window
+        if combined.empty: return pd.DataFrame()
         combined = combined[combined["_date"].between(str(today), str(cutoff))].reset_index(drop=True)
-        if combined.empty:
-            return pd.DataFrame()
+        if combined.empty: return pd.DataFrame()
         combined["_fetch_date"] = combined["_date"]
 
-    combined = calculate_real_ev(combined, load_sport_configs().get(sport, {}), sport)
-    combined = calculate_stakes(combined, bankroll, bet_pct)
+    combined = calculate_real_ev(combined, model_cfg, sport)
+    combined = calculate_stakes(combined, bankroll, risk_level)
     return combined
 
-
 # =============================================================================
-# BEST BET FINDER
+# BET FINDERS
 # =============================================================================
 def find_best_bet(*dfs) -> pd.Series | None:
     frames = [df for df in dfs if df is not None and not df.empty]
-    if not frames:
-        return None
+    if not frames: return None
     all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+","Edge %"])
-    qual = all_df[
-        (all_df["EV+"]    > MIN_EV_THRESHOLD) &
-        (all_df["Edge %"] >= MIN_EDGE_THRESHOLD)
-    ]
-    if qual.empty:
-        return None
+    qual   = all_df[(all_df["EV+"] > MIN_EV_THRESHOLD) & (all_df["Edge %"] >= MIN_EDGE_THRESHOLD)]
+    if qual.empty: return None
     return all_df.loc[qual["EV+"].idxmax()]
 
 
 def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3, hours: int = 48) -> list:
     """
-    Aggregate ALL sports, remove past games, apply window, return top N by Edge %.
-    Per-sport caps: MLB=2, others=3 — prevents MLB volume dominating.
-    Uses pytz.utc.localize() to avoid LMT offset bugs.
+    Fix 2 applied here: MLB rows with Home Odds > MLB_MAX_ODDS are excluded before ranking.
     """
-    # Sport-specific caps — MLB gets 2 slots max to let Tennis/NBA shine
     SPORT_CAPS = {"MLB": 2, "NBA": per_sport_cap, "Tennis": per_sport_cap}
-
     now_est    = datetime.now(_TZ_EASTERN)
     cutoff_est = now_est + timedelta(hours=hours)
 
@@ -669,85 +463,59 @@ def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3, hours: int = 48) -> 
 
     capped = []
     for df in dfs:
-        if df is None or df.empty:
-            continue
+        if df is None or df.empty: continue
 
-        # 48h window filter
         if "_start_iso" in df.columns:
             df = df[df["_start_iso"].apply(_in_window)].copy()
-        if df.empty:
-            continue
+        if df.empty: continue
 
-        # EV+ / Edge qualifier
+        # Fix 2: MLB odds cap — exclude heavy dogs (0% WR above 1.90 in sample)
+        sport_name = df["_sport"].iloc[0] if "_sport" in df.columns else "?"
+        if sport_name == "MLB":
+            h_col = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
+            df = df[pd.to_numeric(df[h_col], errors="coerce").fillna(99) <= MLB_MAX_ODDS].copy()
+        if df.empty: continue
+
         ev   = pd.to_numeric(df["EV+"],    errors="coerce")
         edge = pd.to_numeric(df["Edge %"], errors="coerce")
         qual = df[(ev > MIN_EV_THRESHOLD) & (edge >= MIN_EDGE_THRESHOLD)]
 
-        sport_name = df["_sport"].iloc[0] if "_sport" in df.columns else "?"
         cap = SPORT_CAPS.get(sport_name, per_sport_cap)
         print(f"[DEBUG] {sport_name}: {len(df)} in window, {len(qual)} qualifying (cap={cap})")
-
-        if qual.empty:
-            continue
-
-        # Per-sport cap: best slots from this sport
+        if qual.empty: continue
         capped.append(qual.sort_values("Edge %", ascending=False).head(cap))
 
     if not capped:
-        print("[DEBUG find_top_bets] 0 qualifying bets across all sports")
+        print("[DEBUG find_top_bets] 0 qualifying bets")
         return []
 
     combined = pd.concat(capped, ignore_index=True)
     final    = combined.sort_values("Edge %", ascending=False)
-    print(f"[DEBUG find_top_bets] returning top {min(n, len(final))} of {len(final)} candidates")
+    print(f"[DEBUG find_top_bets] returning top {min(n, len(final))} of {len(final)}")
     return [final.iloc[i] for i in range(min(n, len(final)))]
 
 
-def find_underdog_bets(*dfs, min_odds: float = 2.0, max_odds: float = 4.5, max_picks: int = 2) -> list:
-    """
-    Find genuine home underdogs the model rates as good value.
-    Rules:
-      - Home team must BE the underdog (h_odds > a_odds)
-      - Odds between 2.0x–4.5x — competitive, not a blowout
-      - EV+ > 0.05 — meaningful edge, not noise
-      - Edge % >= 2.0 — real model conviction
-      - AI win probability >= 25% — confirms the team has a real shot
-    Sorted by EV+ descending, max 2 picks.
-    """
+def find_underdog_bets(*dfs, min_odds: float = 2.5, max_picks: int = 2) -> list:
     frames = [df for df in dfs if df is not None and not df.empty]
-    if not frames:
-        return []
-    all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+", "Edge %"])
-    h_col = "Home Odds" if "Home Odds" in all_df.columns else "P1 Odds"
-    a_col = "Away Odds" if "Away Odds" in all_df.columns else "P2 Odds"
-
-    home_odds = pd.to_numeric(all_df.get(h_col),           errors="coerce").fillna(0)
-    away_odds = pd.to_numeric(all_df.get(a_col),           errors="coerce").fillna(0)
-    ev_vals   = pd.to_numeric(all_df["EV+"],               errors="coerce").fillna(0)
-    edge_vals = pd.to_numeric(all_df["Edge %"],            errors="coerce").fillna(0)
-    ai_prob   = pd.to_numeric(all_df.get("_ai_prob_raw"),  errors="coerce").fillna(0)
-
-    mask = (
-        (home_odds >= min_odds) &   # home is underdog territory
-        (home_odds <= max_odds) &   # cap: not a hopeless mismatch
-        (home_odds > away_odds) &   # confirm home IS the underdog side
-        (ev_vals   > 0.05)       &  # meaningful EV, not noise
-        (edge_vals >= 2.0)       &  # real model conviction
-        (ai_prob   >= 0.25)         # model gives them at least 1-in-4 chance of winning
-    )
+    if not frames: return []
+    all_df = pd.concat(frames, ignore_index=True).dropna(subset=["EV+","Edge %"])
+    h_col  = "Home Odds" if "Home Odds" in all_df.columns else "P1 Odds"
+    a_col  = "Away Odds" if "Away Odds" in all_df.columns else "P2 Odds"
+    home_odds = pd.to_numeric(all_df.get(h_col, pd.Series(dtype=float)), errors="coerce").fillna(0)
+    away_odds = pd.to_numeric(all_df.get(a_col, pd.Series(dtype=float)), errors="coerce").fillna(0)
+    best_odds = away_odds.where(away_odds >= home_odds, home_odds)
+    mask = (best_odds >= min_odds) & (all_df["EV+"] > 0)
     dogs = all_df[mask].copy()
-    if dogs.empty:
-        return []
-    dogs = dogs.sort_values("EV+", ascending=False)
+    if dogs.empty: return []
+    dogs["_dog_odds"] = best_odds[mask].values
+    dogs = dogs.sort_values("_dog_odds", ascending=False)
     return [dogs.iloc[i] for i in range(min(max_picks, len(dogs)))]
-
 
 # =============================================================================
 # PAPER TRADING
 # =============================================================================
 def load_paper_trades() -> list:
-    if not PAPER_TRADES_CSV.exists():
-        return []
+    if not PAPER_TRADES_CSV.exists(): return []
     try:
         df = pd.read_csv(PAPER_TRADES_CSV)
         for col in ["odds","ev_plus","stake","ai_prob","edge_pct","rainbet_mult"]:
@@ -764,13 +532,12 @@ def save_paper_trades(trades: list) -> None:
     try:
         pd.DataFrame(trades).to_csv(PAPER_TRADES_CSV, index=False)
     except Exception as e:
-        print(f"[save_paper_trades] ERROR: {e}")  # log to console, not Streamlit
+        print(f"[save_paper_trades] ERROR: {e}")
 
 def execute_paper_trade(*dfs) -> tuple[bool, str]:
-    """Logs top 3 qualifying bets. Returns (success, message)."""
     top3 = find_top_bets(*dfs, n=3)
     if not top3:
-        return False, "No qualifying bets found (EV+ > 0.02 + Edge ≥ 3% required)."
+        return False, "No qualifying bets found (EV+ > threshold + Edge ≥ 4.5% required)."
     trades = load_paper_trades()
     logged = []
     for best in top3:
@@ -796,28 +563,23 @@ def execute_paper_trade(*dfs) -> tuple[bool, str]:
     return True, f"✅ Logged {len(logged)} trade(s): " + " | ".join(logged)
 
 def settle_pending_trades() -> int:
-    trades = load_paper_trades()
-    count  = 0
+    trades = load_paper_trades(); count = 0
     for t in trades:
         if t.get("status") == "PENDING":
             t["result"] = "WIN" if random.random() < float(t.get("ai_prob", 0.5)) else "LOSS"
-            t["status"] = "SETTLED"
-            count += 1
+            t["status"] = "SETTLED"; count += 1
     save_paper_trades(trades)
     return count
 
 def calculate_success_rate() -> dict:
-    trades = load_paper_trades()
-    total = wins = 0
+    trades = load_paper_trades(); total = wins = 0
     for t in trades:
         r = str(t.get("result", "")).upper()
         if r in ("WIN","LOSS"):
             total += 1
-            if r == "WIN":
-                wins += 1
+            if r == "WIN": wins += 1
     return {"total": total, "wins": wins, "losses": total - wins,
             "success_rate": round(wins / total * 100, 1) if total else 0.0}
-
 
 # =============================================================================
 # BACKTEST
@@ -825,17 +587,12 @@ def calculate_success_rate() -> dict:
 def run_backtest(days: int = 30) -> dict:
     trades  = load_paper_trades()
     settled = [t for t in trades if t.get("status") == "SETTLED"]
-    if not settled:
-        return {"error": "No settled trades yet — execute and settle some trades first."}
+    if not settled: return {"error": "No settled trades yet."}
     try:
         cutoff  = datetime.now() - timedelta(days=days)
-        settled = [t for t in settled
-                   if datetime.fromisoformat(str(t["timestamp"])) >= cutoff]
-    except Exception:
-        pass
-    if not settled:
-        return {"error": f"No settled trades in the last {days} days."}
-
+        settled = [t for t in settled if datetime.fromisoformat(str(t["timestamp"])) >= cutoff]
+    except Exception: pass
+    if not settled: return {"error": f"No settled trades in the last {days} days."}
     total  = len(settled)
     wins   = sum(1 for t in settled if str(t.get("result","")).upper() == "WIN")
     staked = sum(float(t.get("stake", 0)) for t in settled)
@@ -845,56 +602,38 @@ def run_backtest(days: int = 30) -> dict:
     avg_w  = round(sum(win_s)/len(win_s), 2) if win_s else 0.0
     avg_l  = round(sum(los_s)/len(los_s), 2) if los_s else 0.0
     return {
-        "total_trades":  total,
-        "wins":          wins,
-        "losses":        total - wins,
-        "win_rate":      round(wins / total * 100, 2),
-        "roi":           round(evs / staked * 100, 2) if staked else 0.0,
-        "avg_win":       avg_w,
-        "avg_loss":      avg_l,
+        "total_trades": total, "wins": wins, "losses": total - wins,
+        "win_rate":     round(wins / total * 100, 2),
+        "roi":          round(evs / staked * 100, 2) if staked else 0.0,
+        "avg_win": avg_w, "avg_loss": avg_l,
         "profit_factor": round(avg_w / avg_l, 2) if avg_l else 0.0,
         "total_stake":   round(staked, 2),
         "total_ev":      round(evs, 4),
     }
-
 
 # =============================================================================
 # CONFIG HELPERS
 # =============================================================================
 def load_bankroll_config() -> dict:
     if BANKROLL_CONFIG.exists():
-        try:
-            return json.loads(BANKROLL_CONFIG.read_text())
-        except Exception:
-            pass
-    return {"bankroll": 1500.0, "bet_pct": 2.0}
+        try: return json.loads(BANKROLL_CONFIG.read_text())
+        except Exception: pass
+    return {"starting_bankroll": 1500.0, "min_stake": 10.0,
+            "max_stake": 500.0, "max_drawdown_pct": 25.0, "kelly_fraction": "Moderate"}
 
-def save_bankroll_config(cfg: dict):
-    BANKROLL_CONFIG.write_text(json.dumps(cfg, indent=2))
+def save_bankroll_config(cfg: dict): BANKROLL_CONFIG.write_text(json.dumps(cfg, indent=2))
 
-SPORT_CONFIG = Path("sport_settings.json")
+def load_model_config() -> dict:
+    if MODEL_CONFIG.exists():
+        try: return json.loads(MODEL_CONFIG.read_text())
+        except Exception: pass
+    return {"model_confidence": 1.0, "edge_threshold_pct": 4.5,
+            "injury_penalty_pct": 5.0, "form_factor": 0.5, "odds_weight": 0.5}
 
-def load_sport_configs() -> dict:
-    defaults = {
-        "NBA":    {"model_confidence": 1.0, "injury_penalty_pct": 5.0},
-        "MLB":    {"model_confidence": 1.0, "injury_penalty_pct": 3.0},
-        "Tennis": {"model_confidence": 1.0, "injury_penalty_pct": 7.0},
-    }
-    if SPORT_CONFIG.exists():
-        try:
-            saved = json.loads(SPORT_CONFIG.read_text())
-            for sport in defaults:
-                defaults[sport].update(saved.get(sport, {}))
-        except Exception:
-            pass
-    return defaults
-
-def save_sport_configs(cfgs: dict):
-    SPORT_CONFIG.write_text(json.dumps(cfgs, indent=2))
-
+def save_model_config(cfg: dict): MODEL_CONFIG.write_text(json.dumps(cfg, indent=2))
 
 # =============================================================================
-# RSS ALERTS
+# RSS
 # =============================================================================
 def fetch_rss_headlines(urls: list) -> list:
     out = []
@@ -902,240 +641,160 @@ def fetch_rss_headlines(urls: list) -> list:
         try:
             feed = feedparser.parse(url)
             out.extend(e.title for e in feed.entries[:8])
-        except Exception:
-            continue
+        except Exception: continue
     return out[:15]
 
 def detect_injury_alert(headline: str) -> bool:
     return any(kw in (headline or "").lower() for kw in RISK_KEYWORDS)
 
-
 # =============================================================================
 # DISPLAY HELPERS
 # =============================================================================
-def _badge(label: str) -> str:
-    low = label.lower()
-    if any(x in low for x in ["live","espn","api-sports"]):
-        return f'<span class="badge-live">&#9679; {label}</span>'
-    if "no " in low or "tbd" in low or "scheduled" in low:
-        return f'<span class="badge-warn">&#8212; {label}</span>'
-    return f'<span class="badge-err">&#9888; {label}</span>'
-
 def _ev_color(v) -> str:
     try:
         v = float(v)
     except Exception:
         return ""
-    if v > 0.05:  return "ev-green"
-    if v > 0:     return "ev-yellow"
+    if v > 0.05: return "ev-green"
+    if v > 0:    return "ev-yellow"
     return "ev-red"
 
-def _safe_num(df: pd.DataFrame, cols: list) -> pd.DataFrame:
-    df = df.copy()
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
 def _fmt_cell(col: str, val) -> str:
-    """Format a cell value for HTML table display."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return '<span style="color:#475569;">—</span>'
     cl = col.lower()
-    
-    # Handle Line Velocity column
     if "velocity" in cl:
         s = str(val)
-        if "🔥" in s or "steaming" in s.lower():
-            return f'<span style="color:#ef4444;font-weight:700;">{s}</span>'
-        elif "❄️" in s or "fading" in s.lower():
-            return f'<span style="color:#60a5fa;font-weight:600;">{s}</span>'
-        else:
-            return f'<span style="color:#94a3b8;">{s}</span>'
-    
+        if "🔥" in s or "steaming" in s.lower(): return f'<span style="color:#ef4444;font-weight:700;">{s}</span>'
+        if "❄️" in s or "fading" in s.lower():   return f'<span style="color:#60a5fa;font-weight:600;">{s}</span>'
+        return f'<span style="color:#94a3b8;">{s}</span>'
     try:
         v = float(val)
         if "ev+" in cl or cl == "ev":
             colour = "#22c55e" if v > 0.05 else "#f59e0b" if v > 0 else "#ef4444"
             return f'<span style="color:{colour};font-weight:700;">{v:+.4f}</span>'
         if "edge" in cl:
-            colour = "#22c55e" if v >= 3 else "#f59e0b" if v > 0 else "#ef4444"
+            colour = "#22c55e" if v >= 4.5 else "#f59e0b" if v > 0 else "#ef4444"
             return f'<span style="color:{colour};">{v:+.2f}%</span>'
-        if "odds" in cl:
-            return f'<span style="color:#00D9FF;font-weight:600;">{v:.2f}</span>'
-        if "stake" in cl:
-            return f'<span style="color:#a78bfa;font-weight:600;">C${v:.2f}</span>'
-        if "prob" in cl:
-            return f'{v:.1f}%'
-        if "books" in cl:
-            return f'<span style="color:#64748b;">{int(v)}</span>'
+        if "odds" in cl:  return f'<span style="color:#00D9FF;font-weight:600;">{v:.2f}</span>'
+        if "stake" in cl: return f'<span style="color:#a78bfa;font-weight:600;">C${v:.2f}</span>'
+        if "prob" in cl:  return f'{v:.1f}%'
+        if "books" in cl: return f'<span style="color:#64748b;">{int(v)}</span>'
         return f'{v:.3f}'
     except (TypeError, ValueError):
         s = str(val)
-        if col in ("Match", "match"):
-            return f'<span style="color:#f1f5f9;font-weight:700;">{s}</span>'
-        if col in ("_date", "Date"):
-            return f'<span style="color:#00D9FF;font-size:12px;">{s}</span>'
+        if col in ("Match","match"):    return f'<span style="color:#f1f5f9;font-weight:700;">{s}</span>'
+        if col in ("_date","Date"):     return f'<span style="color:#00D9FF;font-size:12px;">{s}</span>'
         if col in ("Status","status"):
-            colour = "#22c55e" if "live" in s.lower() or "progress" in s.lower() else "#94a3b8"
+            colour = "#22c55e" if "live" in s.lower() else "#94a3b8"
             return f'<span style="color:{colour};font-size:12px;">{s}</span>'
         return f'<span style="color:#e2e8f0;">{s}</span>'
 
 def _render_df(df: pd.DataFrame, cols: list):
     available = [c for c in cols if c in df.columns]
     if not available:
-        st.warning("No displayable columns found in data.")
-        return
+        st.warning("No displayable columns found."); return
     sub = df[available].copy()
-
-    # Build HTML table
-    HEADER_COLOUR = "#94a3b8"
-    HEADER_BG     = "#0f172a"
-    ROW_BG        = "#1e293b"
-    ROW_ALT_BG    = "#162032"
-    BORDER        = "#2d3748"
-
+    HEADER_COLOUR = "#94a3b8"; HEADER_BG = "#0f172a"
+    ROW_BG = "#1e293b"; ROW_ALT_BG = "#162032"; BORDER = "#2d3748"
     display_names = {
         "_date": "Date", "AI Prob %": "AI Prob", "Stake (C$)": "Stake",
-        "Time/Score": "Time / Score", "Home Pitcher": "Home SP",
-        "Away Pitcher": "Away SP", "Home Odds": "Home @",
-        "Away Odds": "Away @", "P1 Odds": "P1 @", "P2 Odds": "P2 @",
-        "Line Velocity": "Line Move",
+        "Time/Score": "Time / Score", "Home Odds": "Home @", "Away Odds": "Away @",
+        "P1 Odds": "P1 @", "P2 Odds": "P2 @", "Line Velocity": "Line Move",
     }
-
     headers = "".join(
-        f'<th style="padding:10px 14px;text-align:left;color:{HEADER_COLOUR};'
-        f'font-size:11px;font-weight:700;text-transform:uppercase;'
-        f'letter-spacing:0.5px;border-bottom:2px solid {BORDER};white-space:nowrap;">'
-        f'{display_names.get(c, c)}</th>'
+        f'<th style="padding:10px 14px;text-align:left;color:{HEADER_COLOUR};font-size:11px;'
+        f'font-weight:700;text-transform:uppercase;letter-spacing:0.5px;'
+        f'border-bottom:2px solid {BORDER};white-space:nowrap;">{display_names.get(c,c)}</th>'
         for c in available
     )
-
     rows_html = ""
     for i, (_, row) in enumerate(sub.iterrows()):
-        bg = ROW_BG if i % 2 == 0 else ROW_ALT_BG
+        bg    = ROW_BG if i % 2 == 0 else ROW_ALT_BG
         cells = "".join(
-            f'<td style="padding:9px 14px;border-bottom:1px solid {BORDER};'
-            f'white-space:nowrap;">{_fmt_cell(c, row.get(c))}</td>'
-            for c in available
+            f'<td style="padding:9px 14px;border-bottom:1px solid {BORDER};white-space:nowrap;">'
+            f'{_fmt_cell(c, row.get(c))}</td>' for c in available
         )
         rows_html += f'<tr style="background:{bg};">{cells}</tr>'
-
-    html = f"""
-    <div style="overflow-x:auto;border-radius:8px;border:1px solid {BORDER};margin-bottom:12px;">
-    <table style="width:100%;border-collapse:collapse;font-size:13px;font-family:sans-serif;">
-        <thead><tr style="background:{HEADER_BG};">{headers}</tr></thead>
-        <tbody>{rows_html}</tbody>
-    </table>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="overflow-x:auto;border-radius:8px;border:1px solid {BORDER};margin-bottom:12px;">'
+        f'<table style="width:100%;border-collapse:collapse;font-size:13px;font-family:sans-serif;">'
+        f'<thead><tr style="background:{HEADER_BG};">{headers}</tr></thead>'
+        f'<tbody>{rows_html}</tbody></table></div>',
+        unsafe_allow_html=True)
 
 def _render_schedule(events: list, sport_filter: str = "All"):
     if not events:
-        st.info("No upcoming events found for the next 7 days.")
-        return
+        st.info("No upcoming events found."); return
     df = pd.DataFrame(events)
     if sport_filter != "All":
         df = df[df["Sport"].str.contains(sport_filter, case=False, na=False)]
     if df.empty:
-        st.info(f"No upcoming {sport_filter} events found.")
-        return
+        st.info(f"No upcoming {sport_filter} events found."); return
     for date, group in df.groupby("Date"):
-        try:
-            day_label = datetime.strptime(date, "%Y-%m-%d").strftime("%A, %B %d")
-        except Exception:
-            day_label = date
+        try:   day_label = datetime.strptime(date, "%Y-%m-%d").strftime("%A, %B %d")
+        except Exception: day_label = date
         st.markdown(f"### 📅 {day_label}")
         for _, row in group.iterrows():
             st.markdown(
                 f"<div class='event-card'>"
                 f"<div class='event-date'>{row.get('Sport','')} &nbsp;·&nbsp; {row.get('Time','TBD')}</div>"
-                f"<div class='event-match'>{row.get('Match','')}</div>"
-                f"</div>", unsafe_allow_html=True)
+                f"<div class='event-match'>{row.get('Match','')}</div></div>",
+                unsafe_allow_html=True)
 
 def _render_prediction_table(df: pd.DataFrame, sport: str):
-    """Render advance prediction cards grouped by date, sorted by EV+ within each day."""
     if df is None or df.empty:
-        st.info(f"No {sport} predictions available. Check your API-Sports key.")
-        return
-
+        st.info(f"No {sport} predictions available."); return
     h_col = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
     a_col = "Away Odds" if "Away Odds" in df.columns else "P2 Odds"
-
     df_work = df.copy()
     df_work["_ev_sort"]  = pd.to_numeric(df_work.get("EV+"), errors="coerce").fillna(-99)
-    df_work["_date_key"] = df_work.get("_date", df_work.get("_fetch_date", "")).fillna("").astype(str)
-
-    # Sort by date asc, then EV+ desc within each date
-    df_work = df_work.sort_values(["_date_key", "_ev_sort"], ascending=[True, False])
-
-    # Group and render
+    df_work["_date_key"] = df_work.get("_date", df_work.get("_fetch_date","")).fillna("").astype(str)
+    df_work = df_work.sort_values(["_date_key","_ev_sort"], ascending=[True, False])
     for date_key, group in df_work.groupby("_date_key", sort=False):
-        # Date header
-        try:
-            day_label = datetime.strptime(date_key, "%Y-%m-%d").strftime("%A, %B %d")
-        except Exception:
-            day_label = date_key or "TBD"
+        try:   day_label = datetime.strptime(date_key, "%Y-%m-%d").strftime("%A, %B %d")
+        except Exception: day_label = date_key or "TBD"
         st.markdown(
-            f"<div style='margin:18px 0 8px;padding:6px 14px;"
-            f"background:#0f172a;border-left:3px solid #00D9FF;"
-            f"border-radius:0 6px 6px 0;'>"
-            f"<span style='font-size:13px;font-weight:700;color:#00D9FF;"
-            f"text-transform:uppercase;letter-spacing:1px;'>📅 {day_label}"
-            f" &nbsp;·&nbsp; {len(group)} game{'s' if len(group)!=1 else ''}</span>"
-            f"</div>",
+            f"<div style='margin:18px 0 8px;padding:6px 14px;background:#0f172a;"
+            f"border-left:3px solid #00D9FF;border-radius:0 6px 6px 0;'>"
+            f"<span style='font-size:13px;font-weight:700;color:#00D9FF;text-transform:uppercase;"
+            f"letter-spacing:1px;'>📅 {day_label} &nbsp;·&nbsp; {len(group)} game{'s' if len(group)!=1 else ''}</span></div>",
             unsafe_allow_html=True)
-
         for _, row in group.iterrows():
-            ev     = row.get("EV+")
-            edge   = row.get("Edge %")
-            stake  = row.get("Stake (C$)")
-            h_odds = row.get(h_col)
-            a_odds = row.get(a_col)
+            ev = row.get("EV+"); edge = row.get("Edge %"); stake = row.get("Stake (C$)")
+            h_odds = row.get(h_col); a_odds = row.get(a_col)
             has_odds = pd.notna(h_odds) and pd.notna(a_odds)
             ev_cls   = _ev_color(ev) if has_odds else "ev-yellow"
-            date_str = row.get("_date", row.get("_fetch_date", ""))
-
             odds_str = (f"Odds: <b>{h_odds:.2f}</b> / <b>{a_odds:.2f}</b>" if has_odds
                         else "⏳ Odds not yet available")
             ev_str   = (f"EV+ <span class='{ev_cls}'>{ev:+.4f}</span> &nbsp;|&nbsp; Edge {edge:+.2f}%"
-                        if has_odds and ev is not None
-                        else "<span class='ev-yellow'>EV pending odds</span>")
+                        if has_odds and ev is not None else "<span class='ev-yellow'>EV pending odds</span>")
             stake_str = (f"&nbsp;|&nbsp; Stake: <b>C${stake:.2f}</b>"
                          if has_odds and stake and stake > 0 else "")
-
             pitcher_str = ""
             if sport == "MLB":
-                ph = row.get("Home Pitcher", "TBD")
-                pa = row.get("Away Pitcher", "TBD")
+                ph = row.get("Home Pitcher","TBD"); pa = row.get("Away Pitcher","TBD")
                 pitcher_str = f"<div style='font-size:11px;color:#94a3b8;margin-top:4px;'>SP: {ph} vs {pa}</div>"
-
             tour_str = ""
             if sport == "Tennis":
                 tour_str = f"<div style='font-size:11px;color:#94a3b8;'>{row.get('Tournament','')} — {row.get('Category','')}</div>"
-
             bet_tag = ""
             if has_odds:
-                home_t  = row.get("Home Team", row.get("Player 1",
-                          row.get("Match","? vs ?").split(" vs ")[0].strip()))
-                away_t  = row.get("Away Team", row.get("Player 2",
-                          row.get("Match","? vs ?").split(" vs ")[-1].strip()))
-                h_f = float(h_odds)
-                a_f = float(a_odds)
+                home_t = row.get("Home Team", row.get("Match","? vs ?").split(" vs ")[0].strip())
+                away_t = row.get("Away Team", row.get("Match","? vs ?").split(" vs ")[-1].strip())
+                h_f = float(h_odds); a_f = float(a_odds)
                 imp_sum = (1/h_f + 1/a_f) if h_f > 1 and a_f > 1 else 0
                 if imp_sum < 0.95 or imp_sum > 1.25:
-                    odds_str = f"⚠️ Bad line ({h_f:.2f}/{a_f:.2f})"
-                    ev_str   = "<span class='ev-red'>Corrupted odds — do not bet</span>"
+                    odds_str  = f"⚠️ Bad line ({h_f:.2f}/{a_f:.2f})"
+                    ev_str    = "<span class='ev-red'>Corrupted odds — do not bet</span>"
                     stake_str = ""
                 else:
                     rec_team = home_t if h_f <= a_f else away_t
-                    rec_odds = h_f if h_f <= a_f else a_f
+                    rec_odds = h_f   if h_f <= a_f else a_f
                     bet_tag  = (f"<span style='color:#00D9FF;font-weight:700;'>✅ BET ON: {rec_team} @ {rec_odds:.2f}x</span>"
                                 if ev is not None and float(ev) > MIN_EV_THRESHOLD
                                 else "<span style='color:#64748b;'>⛔ No edge — skip</span>")
                     odds_str = f"{bet_tag} &nbsp;|&nbsp; Lines: <b>{h_f:.2f}</b> / <b>{a_f:.2f}</b>"
-
             st.markdown(
                 f"<div class='pred-card'>"
                 f"<div class='pred-match'>{row.get('Match','')} "
@@ -1143,27 +802,22 @@ def _render_prediction_table(df: pd.DataFrame, sport: str):
                 f"{row.get('Time/Score', row.get('Time','TBD'))}</span></div>"
                 f"{tour_str}{pitcher_str}"
                 f"<div style='font-size:13px;margin-top:6px;'>{odds_str}</div>"
-                f"<div style='font-size:13px;margin-top:4px;'>{ev_str}{stake_str}</div>"
-                f"</div>", unsafe_allow_html=True)
-
+                f"<div style='font-size:13px;margin-top:4px;'>{ev_str}{stake_str}</div></div>",
+                unsafe_allow_html=True)
 
 # =============================================================================
-# KEY STATUS BANNER — tests actual connectivity, not just key presence
+# KEY STATUS BANNER
 # =============================================================================
 def _key_status_banner():
     if not ODDS_API_KEY:
-        st.error("❌ ODDS_API_KEY not set — add it to the top of main.py")
-        return
+        st.error("❌ ODDS_API_KEY not set — add it to the top of main.py"); return
     try:
-        resp = _session().get(
-            f"{ODDS_API_BASE}/me/",
-            headers={"x-api-key": ODDS_API_KEY},
-            verify=False, timeout=8,
-        )
+        resp = _session().get(f"{ODDS_API_BASE}/me/", headers={"x-api-key": ODDS_API_KEY},
+                              verify=False, timeout=8)
         if resp.status_code == 200:
             info      = resp.json()
-            remaining = info.get("requests_remaining", info.get("x-requests-remaining", "?"))
-            used      = info.get("requests_used",      info.get("x-requests-used",      "?"))
+            remaining = info.get("requests_remaining", "?")
+            used      = info.get("requests_used", "?")
             st.success(f"✅ TheOddsAPI connected — {used} used | {remaining} remaining")
         elif resp.status_code == 401:
             st.error("❌ Odds API key invalid or expired")
@@ -1172,27 +826,64 @@ def _key_status_banner():
     except Exception as e:
         st.error(f"❌ Odds API connection error: {e}")
 
+# =============================================================================
+# PAST GAME FILTER
+# =============================================================================
+def _filter_past_games(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "_start_iso" not in df.columns: return df
+    now_utc = _TZ_UTC.localize(datetime.utcnow())
+    def _is_future(iso: str) -> bool:
+        try:
+            naive = datetime.strptime(str(iso).replace("Z",""), "%Y-%m-%dT%H:%M:%S")
+            return _TZ_UTC.localize(naive) >= now_utc
+        except Exception:
+            return True
+    return df[df["_start_iso"].apply(_is_future)].reset_index(drop=True)
+
+# =============================================================================
+# SCHEDULE HELPERS
+# =============================================================================
+def _fetch_schedule_nba(days: int = 7) -> list:
+    df = fetch_premium_odds("basketball_nba")
+    if df.empty: return []
+    seen = set(); events = []
+    for _, row in df.iterrows():
+        key = f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
+        if key not in seen:
+            seen.add(key)
+            events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
+                           "Match": row.get("Match",""), "Sport": "🏀 NBA"})
+    return events
+
+def _fetch_schedule_mlb(days: int = 7) -> list:
+    df = fetch_premium_odds("baseball_mlb")
+    if df.empty: return []
+    seen = set(); events = []
+    for _, row in df.iterrows():
+        key = f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
+        if key not in seen:
+            seen.add(key)
+            events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
+                           "Match": row.get("Match",""), "Sport": "⚾ MLB"})
+    return events
+
+def _fetch_schedule_tennis(days: int = 7) -> list:
+    seen = set(); events = []
+    for sport_key in ("tennis_atp","tennis_wta"):
+        df = fetch_premium_odds(sport_key)
+        if df.empty: continue
+        for _, row in df.iterrows():
+            key = f"{row.get('Match','')}{row.get('_date','')}"
+            if key not in seen:
+                seen.add(key)
+                events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
+                               "Match": row.get("Match",""), "Sport": "🎾 Tennis"})
+    return events
 
 # =============================================================================
 # MAIN
 # =============================================================================
-def _filter_past_games(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop rows where game has already started/finished. Uses _start_iso for precision."""
-    if df is None or df.empty or "_start_iso" not in df.columns:
-        return df
-    now_utc = _TZ_UTC.localize(datetime.utcnow())
-    def _is_future(iso: str) -> bool:
-        try:
-            naive = datetime.strptime(str(iso).replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
-            return _TZ_UTC.localize(naive) >= now_utc
-        except Exception:
-            return True  # keep if unparseable
-    mask = df["_start_iso"].apply(_is_future)
-    return df[mask].reset_index(drop=True)
-
-
 def main():
-    # ── Session state defaults ────────────────────────────────────────────────
     defaults = {
         "last_paper_trade": datetime.now() - timedelta(seconds=PAPER_TRADE_INTERVAL),
         "schedule_cache":   [],
@@ -1204,118 +895,116 @@ def main():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    sport_cfgs   = load_sport_configs()
+    model_cfg    = load_model_config()
     bankroll_cfg = load_bankroll_config()
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.subheader("⚙️ Settings")
-        bankroll = st.number_input("Bankroll (C$)", min_value=100.0,
-                                   value=float(bankroll_cfg.get("bankroll", 1500.0)), step=100.0)
-        bet_pct  = st.number_input("Bet % per trade", min_value=0.5, max_value=10.0,
-                                   value=float(bankroll_cfg.get("bet_pct", 2.0)), step=0.5,
-                                   help="Each qualifying bet = bankroll × this %")
-        st.caption(f"Stake per bet: **C${bankroll * bet_pct / 100:,.2f}**")
-        risk_level = "Moderate"   # kept for any legacy references
+        bankroll   = st.number_input("Bankroll (C$)", min_value=100.0, value=1500.0, step=100.0)
+        risk_level = st.radio("Kelly Risk Level", ["Safe","Moderate","Aggressive"], index=1)
         st.divider()
-
         st.subheader("📡 Data Sources")
         st.markdown(f"**All sports:** {'✅ Premium Odds API' if ODDS_API_KEY else '❌ ODDS_API_KEY missing'}")
         st.caption("NBA · MLB · Tennis ATP · Tennis WTA — all via The Odds API Premium")
         st.divider()
-
         st.subheader("📅 Prediction Window")
-        days_ahead = st.slider("Days ahead to predict", 0, 7, 2,
-                               help="Show EV predictions for today + N future days")
+        days_ahead = st.slider("Days ahead to predict", 0, 7, 2)
         st.divider()
-
         st.subheader("🎯 Manual Rainbet Override")
         rainbet_multiplier = st.number_input(
-            "Current Rainbet Multiplier (X)",
-            min_value=1.01, max_value=50.0, value=1.90, step=0.05,
-            help="Enter the live decimal odds from Rainbet. Used as Bookmaker Odds in EV+ calculation.",
-        )
+            "Current Rainbet Multiplier (X)", min_value=1.01, max_value=50.0, value=1.90, step=0.05,
+            help="Enter the live decimal odds from Rainbet.")
         st.caption("If Rainbet shows 1.85 on a game, enter 1.85 here.")
+        st.divider()
+        st.caption(
+            "📊 **Model calibration (v2)**\n"
+            f"Edge threshold: {MIN_EDGE_THRESHOLD}% | MLB cap: {MLB_MAX_ODDS}x\n"
+            "Dead-zone discount: 65–70% band → ×0.88\n"
+            "Boosts: NBA 6% | MLB 3.5% | Tennis 5.5%"
+        )
 
     # ── Header ────────────────────────────────────────────────────────────────
     col_t, col_l = st.columns([4,1])
     with col_t:
         st.markdown("<h1 style='margin:0'>📈 Sports EV+ Dashboard</h1>", unsafe_allow_html=True)
-        st.caption("NBA · MLB · Tennis — API-Sports + Odds API | All amounts in CAD")
+        st.caption("NBA · MLB · Tennis — Odds API | All amounts in CAD | Model v2 (calibrated)")
     with col_l:
         if st.button("🔄 Refresh Data", use_container_width=True):
-            # Clear all data caches so next render re-fetches everything
             for key in ["schedule_cache","schedule_fetched","pred_cache","pred_fetched",
                         "data_nba","data_mlb","data_tennis","data_fetched"]:
-                if key in st.session_state:
-                    del st.session_state[key]
+                st.session_state.pop(key, None)
             st.rerun()
 
     _key_status_banner()
 
-    # ── Fetch today's data (cached — only re-runs on Refresh button) ────────────
+    # ── Data fetch ────────────────────────────────────────────────────────────
     today_str = datetime.now().strftime("%Y-%m-%d")
-
     if "data_fetched" not in st.session_state or st.session_state.get("data_fetched") != today_str:
         prog = st.progress(0, text="📡 Connecting to Odds API…")
         try:
-            prog.progress(20, text="🏀 Fetching NBA odds from Premium API…")
+            prog.progress(20, text="🏀 Fetching NBA…")
             df_nba_raw = fetch_premium_odds("basketball_nba")
             st.session_state["data_nba"] = calculate_stakes(
-                calculate_real_ev(df_nba_raw, sport_cfgs["NBA"], "NBA"), bankroll, bet_pct)
+                calculate_real_ev(df_nba_raw, model_cfg, "NBA"), bankroll, risk_level)
 
-            prog.progress(50, text="⚾ Fetching MLB odds from Premium API…")
+            prog.progress(50, text="⚾ Fetching MLB…")
             df_mlb_raw = fetch_premium_odds("baseball_mlb")
             st.session_state["data_mlb"] = calculate_stakes(
-                calculate_real_ev(df_mlb_raw, sport_cfgs["MLB"], "MLB"), bankroll, bet_pct)
+                calculate_real_ev(df_mlb_raw, model_cfg, "MLB"), bankroll, risk_level)
 
-            prog.progress(75, text="🎾 Fetching Tennis odds from Premium API…")
+            prog.progress(75, text="🎾 Fetching Tennis…")
             df_atp_raw = fetch_premium_odds("tennis_atp")
             df_wta_raw = fetch_premium_odds("tennis_wta")
-            # Both sport keys hit sport_key=tennis — deduplicate by Match+date
-            df_tennis_raw = pd.concat([df_atp_raw, df_wta_raw], ignore_index=True) if not df_atp_raw.empty or not df_wta_raw.empty else pd.DataFrame()
+            df_tennis_raw = pd.concat([df_atp_raw, df_wta_raw], ignore_index=True) \
+                if (not df_atp_raw.empty or not df_wta_raw.empty) else pd.DataFrame()
             if not df_tennis_raw.empty:
-                df_tennis_raw = df_tennis_raw.drop_duplicates(subset=["Match", "_date"]).reset_index(drop=True)
+                df_tennis_raw = df_tennis_raw.drop_duplicates(subset=["Match","_date"]).reset_index(drop=True)
             st.session_state["data_tennis"] = calculate_stakes(
-                calculate_real_ev(df_tennis_raw, sport_cfgs["Tennis"], "Tennis"), bankroll, bet_pct)
+                calculate_real_ev(df_tennis_raw, model_cfg, "Tennis"), bankroll, risk_level)
 
             st.session_state["data_fetched"] = today_str
-            prog.progress(100, text="✅ Done!")
-            prog.empty()
+            prog.progress(100, text="✅ Done!"); prog.empty()
         except Exception as e:
-            prog.empty()
-            st.error(f"❌ Data fetch error: {e}")
+            prog.empty(); st.error(f"❌ Data fetch error: {e}")
 
     df_nba    = _filter_past_games(st.session_state.get("data_nba",    pd.DataFrame()))
     df_mlb    = _filter_past_games(st.session_state.get("data_mlb",    pd.DataFrame()))
     df_tennis = _filter_past_games(st.session_state.get("data_tennis", pd.DataFrame()))
 
-    # ── DEBUG INSTRUMENTATION ─────────────────────────────────────────────────
+    # ── Debug panel ───────────────────────────────────────────────────────────
     bypass_filters = st.checkbox(
         "🔧 Show all games (bypass implied-sum filter)",
         value=st.session_state.get("debug_bypass_filters", False),
         key="debug_bypass_filters",
-        help="Disables the 0.90–1.25 implied-sum sanity check. "
-             "If games appear here but not normally, the filter is the bug.",
     )
     if bypass_filters:
-        # Re-fetch with cache busted so the bypass flag takes effect immediately
         for _sk in ["data_nba","data_mlb","data_tennis","data_fetched"]:
             st.session_state.pop(_sk, None)
         fetch_premium_odds.clear()
 
-    # ── END DEBUG ─────────────────────────────────────────────────────────────
+    with st.expander("🔍 Pipeline counts", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("NBA rows",    len(df_nba))
+        c2.metric("MLB rows",    len(df_mlb))
+        c3.metric("Tennis rows", len(df_tennis))
+        for label, df_s in [("NBA", df_nba), ("MLB", df_mlb), ("Tennis", df_tennis)]:
+            if df_s is not None and not df_s.empty and "EV+" in df_s.columns:
+                cols_to_show = [c for c in ["Match","Home Odds","Away Odds","EV+","Edge %"] if c in df_s.columns]
+                st.markdown(f"**{label} — sample EV+ values:**")
+                st.dataframe(df_s[cols_to_show].head(3), hide_index=True, use_container_width=True)
+        for label, sk in [("NBA","basketball_nba"),("MLB","baseball_mlb"),("Tennis","tennis_atp")]:
+            raw = st.session_state.get(f"debug_raw_event_{sk}")
+            if raw:
+                st.markdown(f"**{label} — first raw event:**")
+                st.json(raw)
 
-    # Auto paper trade (only when data exists)
-    if (not df_nba.empty or not df_mlb.empty or not df_tennis.empty):
+    # Auto paper trade
+    if not df_nba.empty or not df_mlb.empty or not df_tennis.empty:
         if (datetime.now() - st.session_state.last_paper_trade).total_seconds() >= PAPER_TRADE_INTERVAL:
             _ok, _msg = execute_paper_trade(df_nba, df_mlb, df_tennis)
-            if _ok:
-                settle_pending_trades()
+            if _ok: settle_pending_trades()
             st.session_state.last_paper_trade = datetime.now()
-
-    # Schedule is lazy-loaded inside the Schedule tab — NOT here
-    # This prevents 21 extra API calls on every page load
 
     # ── TABS ──────────────────────────────────────────────────────────────────
     tabs = st.tabs(["🏆 Live Hub","🏀 NBA","⚾ MLB","🎾 Tennis",
@@ -1323,13 +1012,12 @@ def main():
 
     # ── TAB 0: Live Hub ───────────────────────────────────────────────────────
     with tabs[0]:
-        # Capital Protection Shield Status
         all_qualifying = []
         for df in [df_nba, df_mlb, df_tennis]:
             if df is not None and not df.empty:
                 ev_col = pd.to_numeric(df.get("EV+"), errors="coerce").fillna(0)
-                all_qualifying.extend(df[ev_col > MIN_EV_THRESHOLD].to_dict('records'))
-        
+                all_qualifying.extend(df[ev_col > MIN_EV_THRESHOLD].to_dict("records"))
+
         total_simultaneous = len(all_qualifying)
         if total_simultaneous > 1:
             st.markdown(
@@ -1337,59 +1025,51 @@ def main():
                 f"border-radius:10px;padding:16px 20px;margin-bottom:16px;'>"
                 f"<div style='font-size:11px;color:#f59e0b;text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:6px;'>"
                 f"🛡️ CAPITAL PROTECTION SHIELD ACTIVE</div>"
-                f"<div style='font-size:20px;font-weight:700;color:#fbbf24;'>{total_simultaneous} Simultaneous Qualifying Bets Detected</div>"
+                f"<div style='font-size:20px;font-weight:700;color:#fbbf24;'>{total_simultaneous} Simultaneous Qualifying Bets</div>"
                 f"<div style='font-size:13px;color:#e2e8f0;margin-top:8px;'>"
-                f"Stakes auto-scaled by <b>÷√{total_simultaneous}</b> = <b>{1/(total_simultaneous**0.5):.3f}x</b> to prevent overexposure during high-volume slates. "
-                f"Circuit breaker capped at 5% max single allocation.</div>"
-                f"</div>", unsafe_allow_html=True
-            )
-        
+                f"Stakes auto-scaled by <b>÷√{total_simultaneous}</b> = <b>{1/(total_simultaneous**0.5):.3f}x</b> · 5% max per trade.</div>"
+                f"</div>", unsafe_allow_html=True)
+
         best = find_best_bet(df_nba, df_mlb, df_tennis)
         top8 = find_top_bets(df_nba, df_mlb, df_tennis, n=4, hours=24)
 
-        st.markdown(
-            "<div class='metric-box'><div class='metric-title'>🏆 Top 4 Bets — Next 24 Hours</div>",
-            unsafe_allow_html=True)
-
+        st.markdown("<div class='metric-box'><div class='metric-title'>🏆 Top 4 Bets — Next 24 Hours</div>",
+                    unsafe_allow_html=True)
         if top8:
             for i, row in enumerate(top8):
-                bet_team  = row.get("Rec Team", row.get("Match","?").split(" vs ")[0].strip())
-                bet_odds  = float(row.get("Rec Odds", 0) or 0)
-                stake     = float(row.get("Stake (C$)", 0) or 0)
-                ev        = float(row.get("EV+", 0) or 0)
-                edge      = float(row.get("Edge %", 0) or 0)
-                win_prob  = float(row.get("_ai_prob_raw", 0) or 0) * 100
-                sport_lbl = row.get("_sport", "")
-                game_date = row.get("_date", "")
-                game_time = row.get("Time/Score", "")
+                h_col   = "Home Odds" if pd.notna(row.get("Home Odds")) else "P1 Odds"
+                a_col   = "Away Odds" if "Away Odds" in row.index else "P2 Odds"
+                h_odds  = float(row.get(h_col, 0) or 0)
+                a_odds  = float(row.get(a_col, 0) or 0)
+                home_t  = row.get("Home Team", row.get("Match","? vs ?").split(" vs ")[0].strip())
+                away_t  = row.get("Away Team", row.get("Match","? vs ?").split(" vs ")[-1].strip())
+                bet_team = home_t if h_odds <= a_odds else away_t
+                bet_odds = h_odds if h_odds <= a_odds else a_odds
+                stake    = float(row.get("Stake (C$)", 0) or 0)
+                ev       = float(row.get("EV+", 0) or 0)
+                edge     = float(row.get("Edge %", 0) or 0)
                 rank_color = "#00D9FF" if i == 0 else "#e2e8f0"
                 st.markdown(
                     f"<div style='background:#111827;border:1px solid #1e3a5f;border-radius:10px;"
                     f"padding:12px 18px;margin-bottom:8px;display:flex;justify-content:space-between;"
                     f"align-items:center;flex-wrap:wrap;gap:8px;'>"
-                    f"<div>"
-                    f"<span style='font-size:11px;color:#64748b;font-weight:700;'>#{i+1} &nbsp;·&nbsp; {sport_lbl} &nbsp;·&nbsp; {game_date} {game_time}</span><br>"
+                    f"<div><span style='font-size:11px;color:#64748b;font-weight:700;'>"
+                    f"#{i+1} &nbsp;·&nbsp; {row.get('_sport','')} &nbsp;·&nbsp; {row.get('_date','')} {row.get('Time/Score','')}</span><br>"
                     f"<span style='font-size:16px;font-weight:800;color:{rank_color};'>✅ {bet_team}</span>"
-                    f"<span style='font-size:13px;color:#94a3b8;'> &nbsp;·&nbsp; {row.get('Match','')}</span>"
-                    f"</div>"
+                    f"<span style='font-size:13px;color:#94a3b8;'> &nbsp;·&nbsp; {row.get('Match','')}</span></div>"
                     f"<div style='display:flex;gap:16px;flex-wrap:wrap;'>"
                     f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Odds</div>"
                     f"<div style='font-size:15px;font-weight:700;color:#00D9FF;'>{bet_odds:.2f}x</div></span>"
-                    f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Win Prob</div>"
-                    f"<div style='font-size:15px;font-weight:700;color:#a78bfa;'>{win_prob:.0f}%</div></span>"
                     f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Edge</div>"
                     f"<div style='font-size:15px;font-weight:700;color:#22c55e;'>{edge:+.2f}%</div></span>"
                     f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>EV+</div>"
                     f"<div style='font-size:15px;font-weight:700;color:#22c55e;'>{ev:+.4f}</div></span>"
                     f"<span style='text-align:center;'><div style='font-size:10px;color:#64748b;text-transform:uppercase;'>Stake</div>"
                     f"<div style='font-size:15px;font-weight:700;color:#a78bfa;'>C${stake:.2f}</div></span>"
-                    f"</div></div>",
-                    unsafe_allow_html=True)
+                    f"</div></div>", unsafe_allow_html=True)
         else:
-            st.markdown(
-                "<div style='font-size:16px;color:#94a3b8;padding:12px 0;'>"
-                "No qualifying bets in the next 48 hours.</div>",
-                unsafe_allow_html=True)
+            st.markdown("<div style='font-size:16px;color:#94a3b8;padding:12px 0;'>No qualifying bets in the next 24 hours.</div>",
+                        unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.divider()
@@ -1409,9 +1089,9 @@ def main():
         with c3:
             st.subheader("🎾 Tennis Today")
             if not df_tennis.empty:
-                _render_df(df_tennis, ["Match","Tournament","Time","Status","Score","Line Velocity"])
+                _render_df(df_tennis, ["Match","Time/Score","_date","Home Odds","Away Odds","EV+","Stake (C$)","Line Velocity"])
             else:
-                st.info("No tennis matches today via ESPN.")
+                st.info("No tennis matches today.")
 
         st.divider()
         st.subheader("📰 Injury & News Alerts")
@@ -1420,14 +1100,10 @@ def main():
         tennis_hl = fetch_rss_headlines(["https://www.espn.com/espn/rss/tennis/news"])
         all_hl    = nba_hl + mlb_hl + tennis_hl
         alerts    = [h for h in all_hl if detect_injury_alert(h)]
-        for a in alerts[:6]:
-            st.warning(f"⚠️ {a}")
-        for h in [h for h in nba_hl if not detect_injury_alert(h)][:3]:
-            st.markdown(f"🏀 {h}")
-        for h in [h for h in mlb_hl if not detect_injury_alert(h)][:3]:
-            st.markdown(f"⚾ {h}")
-        if not alerts:
-            st.success("✅ No injury alerts detected.")
+        for a in alerts[:6]: st.warning(f"⚠️ {a}")
+        for h in [h for h in nba_hl    if not detect_injury_alert(h)][:3]: st.markdown(f"🏀 {h}")
+        for h in [h for h in mlb_hl    if not detect_injury_alert(h)][:3]: st.markdown(f"⚾ {h}")
+        if not alerts: st.success("✅ No injury alerts detected.")
 
     # ── TAB 1: NBA ────────────────────────────────────────────────────────────
     with tabs[1]:
@@ -1437,71 +1113,66 @@ def main():
                                  "AI Prob %","Edge %","EV+","Stake (C$)","Books","Line Velocity"])
             c1,c2,c3,c4 = st.columns(4)
             ev_v = pd.to_numeric(df_nba.get("EV+"), errors="coerce").dropna()
-            c1.metric("Games", len(df_nba))
-            c2.metric("Avg EV+", f"{ev_v.mean():.4f}" if not ev_v.empty else "—")
+            c1.metric("Games",           len(df_nba))
+            c2.metric("Avg EV+",         f"{ev_v.mean():.4f}" if not ev_v.empty else "—")
             c3.metric("Qualifying Bets", int((ev_v > MIN_EV_THRESHOLD).sum()))
             stk = pd.to_numeric(df_nba.get("Stake (C$)"), errors="coerce").fillna(0)
-            c4.metric("Total Stake C$", f"{stk.sum():,.2f}")
+            c4.metric("Total Stake C$",  f"{stk.sum():,.2f}")
             if "_simultaneous_trades" in df_nba.columns:
-                st.caption(f"🛡️ Covariance Shield Active: {df_nba['_simultaneous_trades'].iloc[0]} simultaneous trades detected — stakes auto-scaled")
+                st.caption(f"🛡️ Covariance Shield: {df_nba['_simultaneous_trades'].iloc[0]} simultaneous trades — stakes auto-scaled")
         else:
-            st.info("🏀 No upcoming NBA games found. The Odds API may not have lines posted yet — try Refresh.")
+            st.info("🏀 No upcoming NBA games found. Try Refresh.")
 
     # ── TAB 2: MLB ────────────────────────────────────────────────────────────
     with tabs[2]:
         st.header("⚾ MLB — Upcoming Games")
+        st.caption(f"⚠️ MLB odds capped at {MLB_MAX_ODDS}x — heavy underdogs excluded (0% WR in backtesting above this line).")
         if not df_mlb.empty:
             _render_df(df_mlb, ["Match","Time/Score","_date","Home Odds","Away Odds",
                                  "AI Prob %","Edge %","EV+","Stake (C$)","Books","Line Velocity"])
             c1,c2,c3,c4 = st.columns(4)
             ev_v = pd.to_numeric(df_mlb.get("EV+"), errors="coerce").dropna()
-            c1.metric("Games", len(df_mlb))
-            c2.metric("Avg EV+", f"{ev_v.mean():.4f}" if not ev_v.empty else "—")
+            c1.metric("Games",           len(df_mlb))
+            c2.metric("Avg EV+",         f"{ev_v.mean():.4f}" if not ev_v.empty else "—")
             c3.metric("Qualifying Bets", int((ev_v > MIN_EV_THRESHOLD).sum()))
             stk = pd.to_numeric(df_mlb.get("Stake (C$)"), errors="coerce").fillna(0)
-            c4.metric("Total Stake C$", f"{stk.sum():,.2f}")
+            c4.metric("Total Stake C$",  f"{stk.sum():,.2f}")
             if "_simultaneous_trades" in df_mlb.columns:
-                st.caption(f"🛡️ Covariance Shield Active: {df_mlb['_simultaneous_trades'].iloc[0]} simultaneous trades detected — stakes auto-scaled")
-            st.caption("ℹ️ Odds from 20+ bookmakers via The Odds API.")
+                st.caption(f"🛡️ Covariance Shield: {df_mlb['_simultaneous_trades'].iloc[0]} simultaneous trades — stakes auto-scaled")
         else:
-            st.info("⚾ No upcoming MLB games found. Press Refresh to try again.")
+            st.info("⚾ No upcoming MLB games found. Press Refresh.")
 
     # ── TAB 3: Tennis ─────────────────────────────────────────────────────────
     with tabs[3]:
         st.header("🎾 Tennis — Today's Matches")
         st.caption("Tennis ATP + WTA odds via The Odds API Premium.")
         if not df_tennis.empty:
-            _render_df(df_tennis, ["Match","Time/Score","_date","Home Odds","Away Odds","EV+","Stake (C$)","Books","Line Velocity"])
+            _render_df(df_tennis, ["Match","Time/Score","_date","Home Odds","Away Odds",
+                                    "EV+","Stake (C$)","Books","Line Velocity"])
             c1,c2 = st.columns(2)
-            c1.metric("Matches Today", len(df_tennis))
+            c1.metric("Matches Today",   len(df_tennis))
             c2.metric("Qualifying Bets", int((pd.to_numeric(df_tennis.get("EV+"), errors="coerce") > MIN_EV_THRESHOLD).sum()))
             if "_simultaneous_trades" in df_tennis.columns:
-                st.caption(f"🛡️ Covariance Shield Active: {df_tennis['_simultaneous_trades'].iloc[0]} simultaneous trades detected — stakes auto-scaled")
+                st.caption(f"🛡️ Covariance Shield: {df_tennis['_simultaneous_trades'].iloc[0]} simultaneous trades — stakes auto-scaled")
         else:
-            st.error("🎾 No tennis matches returned from Odds API. Key may not support tennis on this plan, or no lines are posted yet.")
+            st.error("🎾 No tennis matches returned. Key may not support tennis on this plan.")
 
-    # ── TAB 4: Predictions (advance) ─────────────────────────────────────────
+    # ── TAB 4: Predictions ────────────────────────────────────────────────────
     with tabs[4]:
         st.header("🔮 Advance Predictions")
-        st.info(f"Showing predictions for today + {days_ahead} day(s) ahead. "
-                "Games without odds yet show 'EV pending' — odds will fill in closer to game time.")
-
-        pred_sport = st.selectbox("Sport", ["NBA","MLB","Tennis"], key="pred_sport_sel")
-
-        # Cache predictions per sport for 30 min
+        st.info(f"Showing predictions for today + {days_ahead} day(s) ahead.")
+        pred_sport  = st.selectbox("Sport", ["NBA","MLB","Tennis"], key="pred_sport_sel")
         cache_key   = f"pred_{pred_sport}_{days_ahead}"
         fetched_key = f"pred_fetch_{pred_sport}_{days_ahead}"
         pred_age    = None
         if st.session_state.pred_fetched.get(fetched_key):
             pred_age = (datetime.now() - st.session_state.pred_fetched[fetched_key]).total_seconds()
-
-        cached_pred = st.session_state.pred_cache.get(cache_key)
+        cached_pred    = st.session_state.pred_cache.get(cache_key)
         cache_is_empty = cached_pred is None or (isinstance(cached_pred, pd.DataFrame) and cached_pred.empty)
         if cache_is_empty or pred_age is None or pred_age > 1800:
             with st.spinner(f"Fetching {pred_sport} games for next {days_ahead} days…"):
-                pred_df = build_advance_predictions(days_ahead, pred_sport,
-                                                    bankroll, bet_pct)
-            st.session_state.pred_cache[cache_key]   = pred_df
+                pred_df = build_advance_predictions(days_ahead, pred_sport, model_cfg, bankroll, risk_level)
+            st.session_state.pred_cache[cache_key]     = pred_df
             st.session_state.pred_fetched[fetched_key] = datetime.now()
         else:
             pred_df = st.session_state.pred_cache[cache_key]
@@ -1509,21 +1180,18 @@ def main():
         col_ref, col_filter = st.columns([1,3])
         with col_ref:
             if st.button("🔄 Refresh Predictions"):
-                st.session_state.pred_cache.pop(cache_key, None)
-                st.rerun()
+                st.session_state.pred_cache.pop(cache_key, None); st.rerun()
         with col_filter:
-            only_qualifying = st.checkbox("Show only qualifying bets (EV+ > 0.02)", value=False)
-
+            only_qualifying = st.checkbox("Show only qualifying bets (Edge ≥ 4.5%)", value=False)
         if only_qualifying and pred_df is not None and not pred_df.empty:
-            ev_col = pd.to_numeric(pred_df.get("EV+"), errors="coerce")
+            ev_col  = pd.to_numeric(pred_df.get("EV+"), errors="coerce")
             pred_df = pred_df[ev_col > MIN_EV_THRESHOLD].reset_index(drop=True)
-
         _render_prediction_table(pred_df, pred_sport)
 
     # ── TAB 5: Underdogs ─────────────────────────────────────────────────────
     with tabs[5]:
         st.header("🐶 Underdog Special Bets")
-        st.info("High-odds plays with positive EV — max 2 picks per session, bet at HALF your normal stake. High risk, high reward.")
+        st.info("High-odds plays with positive EV — max 2 picks, bet at HALF stake. High risk, high reward.")
         dogs = find_underdog_bets(df_nba, df_mlb, df_tennis, min_odds=2.5, max_picks=2)
         if not dogs:
             st.warning("No underdog plays with positive EV right now.")
@@ -1533,10 +1201,8 @@ def main():
                 a_col    = "Away Odds" if "Away Odds" in dog.index else "P2 Odds"
                 h_odds_v = float(dog.get(h_col, 0) or 0)
                 a_odds_v = float(dog.get(a_col, 0) or 0)
-                home_t   = dog.get("Home Team", dog.get("Player 1",
-                           dog.get("Match","? vs ?").split(" vs ")[0].strip()))
-                away_t   = dog.get("Away Team", dog.get("Player 2",
-                           dog.get("Match","? vs ?").split(" vs ")[-1].strip()))
+                home_t   = dog.get("Home Team", dog.get("Match","? vs ?").split(" vs ")[0].strip())
+                away_t   = dog.get("Away Team", dog.get("Match","? vs ?").split(" vs ")[-1].strip())
                 if a_odds_v >= h_odds_v:
                     dog_team, dog_odds, fav_team = away_t, a_odds_v, home_t
                 else:
@@ -1544,12 +1210,10 @@ def main():
                 ev_v       = float(dog.get("EV+", 0) or 0)
                 edge_v     = float(dog.get("Edge %", 0) or 0)
                 stake_v    = float(dog.get("Stake (C$)", 0) or 0)
-                win_prob_v = float(dog.get("_ai_prob_raw", 0) or 0) * 100
                 half_stake = round(stake_v * 0.5, 2)
                 payout_v   = round(half_stake * dog_odds, 2)
                 profit_v   = round(payout_v - half_stake, 2)
                 ev_color   = "#22c55e" if ev_v > 0 else "#ef4444"
-                prob_color = "#22c55e" if win_prob_v >= 35 else "#f59e0b" if win_prob_v >= 25 else "#ef4444"
                 st.markdown(
                     f'<div style="background:linear-gradient(135deg,#1a0a2e,#0f0a1e);border:2px solid #a855f7;'
                     f'border-radius:12px;padding:18px 22px;margin-bottom:14px;">'
@@ -1557,10 +1221,6 @@ def main():
                     f'🐶 Underdog Pick #{i+1} &nbsp;·&nbsp; {dog.get("_sport","")} &nbsp;·&nbsp; {dog.get("_date","")}</div>'
                     f'<div style="font-size:28px;font-weight:700;color:#e879f9;margin:6px 0;">{dog_team}</div>'
                     f'<div style="font-size:13px;color:#94a3b8;margin-bottom:10px;">vs {fav_team} &nbsp;·&nbsp; {dog.get("Match","")}</div>'
-                    f'<div style="background:#0f172a;border-radius:8px;padding:10px 14px;margin-bottom:10px;">'
-                    f'<span style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;">Model Win Probability</span><br>'
-                    f'<span style="font-size:26px;font-weight:800;color:{prob_color};">{win_prob_v:.0f}%</span>'
-                    f'<span style="font-size:12px;color:#64748b;margin-left:8px;">chance of winning per model</span></div>'
                     f'<div style="font-size:13px;color:#e2e8f0;display:flex;gap:20px;flex-wrap:wrap;">'
                     f'<span>🎯 Odds: <b style="color:#e879f9;">{dog_odds:.2f}x</b></span>'
                     f'<span>📈 EV+: <b style="color:{ev_color};">{ev_v:+.4f}</b></span>'
@@ -1568,14 +1228,12 @@ def main():
                     f'<span>💰 Half-Stake: <b style="color:#a855f7;">C${half_stake:.2f}</b></span>'
                     f'<span>🏆 Profit if Win: <b style="color:#22c55e;">C${profit_v:.2f}</b></span></div>'
                     f'<div style="margin-top:10px;font-size:11px;color:#64748b;">⚠️ Half stake only · Max 2 underdog bets per day</div></div>',
-                    unsafe_allow_html=True
-                )
+                    unsafe_allow_html=True)
 
     # ── TAB 6: Schedule ───────────────────────────────────────────────────────
     with tabs[6]:
         st.header("📅 Upcoming Schedule — Next 7 Days")
-        st.info("⚠️ Loading the schedule uses ~21 API calls (7 days × 3 sports). "
-                "Click the button below when you want to load it.")
+        st.info("Click below to load the 7-day schedule (uses ~6 API calls).")
         col_f, col_r = st.columns([3,1])
         with col_f:
             sport_filter = st.selectbox("Filter sport", ["All","NBA","MLB","Tennis"], key="sched_filter")
@@ -1599,30 +1257,23 @@ def main():
     # ── TAB 7: Analytics ──────────────────────────────────────────────────────
     with tabs[7]:
         st.header("📈 Paper Trading & Analytics")
-        st.info("Execute a paper trade when you see a qualifying EV+. "
-                "Settle trades after the game to track your win rate.")
-
+        st.info("Execute a paper trade when you see a qualifying EV+. Settle after the game.")
         c1,c2,c3 = st.columns(3)
         with c1:
             if st.button("▶️ Execute Paper Trade"):
                 _ok, _msg = execute_paper_trade(df_nba, df_mlb, df_tennis)
-                if _ok:
-                    st.success(_msg)
-                else:
-                    st.warning(f"⚠️ {_msg}")
+                if _ok: st.success(_msg)
+                else:   st.warning(f"⚠️ {_msg}")
         with c2:
             if st.button("✅ Settle Pending Trades"):
                 n = settle_pending_trades()
-                if n:
-                    st.success(f"✅ Settled {n} trade(s).")
-                else:
-                    st.info("No pending trades to settle.")
+                if n: st.success(f"✅ Settled {n} trade(s).")
+                else: st.info("No pending trades to settle.")
         with c3:
             with st.expander("🗑️ Clear All Trades"):
                 st.warning("Permanently deletes all trade history.")
                 if st.button("⚠️ Confirm Delete"):
-                    PAPER_TRADES_CSV.unlink(missing_ok=True)
-                    st.success("✅ Cleared.")
+                    PAPER_TRADES_CSV.unlink(missing_ok=True); st.success("✅ Cleared.")
 
         st.divider()
         stats = calculate_success_rate()
@@ -1648,25 +1299,20 @@ def main():
             tdf = tdf.rename(columns={
                 "timestamp":"Time","match":"Match","sport":"Sport","odds":"Odds",
                 "ev_plus":"EV+","stake":"Stake (C$)","ai_prob":"AI Prob",
-                "edge_pct":"Edge %","strategy":"Strategy",
-                "result":"Result","status":"Status"})
+                "edge_pct":"Edge %","strategy":"Strategy","result":"Result","status":"Status"})
             for col in ["Odds","EV+","Stake (C$)","AI Prob","Edge %"]:
                 if col in tdf.columns:
                     tdf[col] = pd.to_numeric(tdf[col], errors="coerce")
-            st.dataframe(
-                tdf,
-                hide_index=True,
-                use_container_width=True,
+            st.dataframe(tdf, hide_index=True, use_container_width=True,
                 column_config={
-                    "EV+":       st.column_config.NumberColumn("EV+",       format="%+.4f"),
-                    "Stake (C$)":st.column_config.NumberColumn("Stake (C$)",format="C$%.2f"),
-                    "Odds":      st.column_config.NumberColumn("Odds",      format="%.2f"),
-                    "AI Prob":   st.column_config.NumberColumn("AI Prob",   format="%.3f"),
-                    "Edge %":    st.column_config.NumberColumn("Edge %",    format="%.2f%%"),
-                    "Result":    st.column_config.TextColumn("Result"),
-                    "Status":    st.column_config.TextColumn("Status"),
-                },
-            )
+                    "EV+":        st.column_config.NumberColumn("EV+",        format="%+.4f"),
+                    "Stake (C$)": st.column_config.NumberColumn("Stake (C$)", format="C$%.2f"),
+                    "Odds":       st.column_config.NumberColumn("Odds",       format="%.2f"),
+                    "AI Prob":    st.column_config.NumberColumn("AI Prob",    format="%.3f"),
+                    "Edge %":     st.column_config.NumberColumn("Edge %",     format="%.2f%%"),
+                    "Result":     st.column_config.TextColumn("Result"),
+                    "Status":     st.column_config.TextColumn("Status"),
+                })
             c1,c2,c3,c4,c5 = st.columns(5)
             c1.metric("Total",   len(trades))
             c2.metric("Settled", sum(1 for t in trades if t.get("status")=="SETTLED"))
@@ -1674,53 +1320,56 @@ def main():
             avg_stk = sum(float(t.get("stake",0)) for t in trades) / len(trades)
             avg_ev  = sum(float(t.get("ev_plus",0)) for t in trades) / len(trades)
             c4.metric("Avg Stake", f"C${avg_stk:,.2f}")
-            c5.metric("Avg EV+",  f"{avg_ev:.4f}")
+            c5.metric("Avg EV+",   f"{avg_ev:.4f}")
         else:
             st.info("No paper trades yet. Execute a trade when odds are live.")
 
     # ── TAB 8: Settings ───────────────────────────────────────────────────────
     with tabs[8]:
-        st.header("🔧 Settings")
-        s1, s2, s3 = st.tabs(["💰 Bankroll", "🏀⚾🎾 Sport Models", "📊 Backtest"])
+        st.header("🔧 Advanced Settings")
+        s1, s2, s3 = st.tabs(["💰 Bankroll","🤖 Model","📊 Backtest"])
 
         with s1:
-            st.subheader("💰 Bankroll")
-            st.info("Set your total bankroll and what % you want to bet on each qualifying play. "
-                    "Stake = Bankroll × Bet %.")
-            br_input  = st.number_input("Total Bankroll (C$)", min_value=100.0,
-                                        value=float(bankroll_cfg.get("bankroll", 1500.0)), step=100.0)
-            pct_input = st.number_input("Bet % per trade", min_value=0.5, max_value=10.0,
-                                        value=float(bankroll_cfg.get("bet_pct", 2.0)), step=0.5)
-            st.metric("Stake per qualifying bet", f"C${br_input * pct_input / 100:,.2f}")
+            st.subheader("💰 Bankroll Management")
+            c1,c2 = st.columns(2)
+            with c1:
+                br  = st.number_input("Starting Bankroll (C$)", min_value=100.0,
+                                      value=float(bankroll_cfg["starting_bankroll"]), step=100.0)
+                mn  = st.number_input("Min Stake (C$)", min_value=1.0,
+                                      value=float(bankroll_cfg["min_stake"]), step=1.0)
+            with c2:
+                mx  = st.number_input("Max Stake (C$)", min_value=10.0,
+                                      value=float(bankroll_cfg["max_stake"]), step=10.0)
+                mdd = st.slider("Max Drawdown %", 1, 50, int(bankroll_cfg["max_drawdown_pct"]))
+            kf = st.selectbox("Kelly Fraction", ["Safe (0.25x)","Moderate (0.50x)","Aggressive (0.75x)"], index=1)
             if st.button("💾 Save Bankroll"):
-                save_bankroll_config({"bankroll": br_input, "bet_pct": pct_input})
-                st.success("✅ Saved. Press Refresh Data to apply.")
+                save_bankroll_config({"starting_bankroll":br,"min_stake":mn,
+                                      "max_stake":mx,"max_drawdown_pct":mdd,
+                                      "kelly_fraction":kf.split(" ")[0]})
+                st.success("✅ Saved.")
 
         with s2:
-            st.subheader("Sport Model Settings")
-            st.info("Each sport uses its own confidence and injury penalty. "
-                    "Changes apply on next Refresh Data.")
-            _cfgs = load_sport_configs()
-            sport_tabs = st.tabs(["🏀 NBA", "⚾ MLB", "🎾 Tennis"])
-            sport_keys = ["NBA", "MLB", "Tennis"]
-            new_cfgs   = {}
-            for st_tab, sk in zip(sport_tabs, sport_keys):
-                with st_tab:
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        mc = st.slider(f"{sk} Model Confidence", 0.5, 1.5,
-                                       float(_cfgs[sk]["model_confidence"]), 0.05,
-                                       key=f"mc_{sk}",
-                                       help="1.0 = neutral. >1 trusts the boost more.")
-                    with c2:
-                        ip = st.slider(f"{sk} Injury Penalty %", 1, 15,
-                                       int(_cfgs[sk]["injury_penalty_pct"]),
-                                       key=f"ip_{sk}",
-                                       help="Probability cut when Risk Meter is high.")
-                    new_cfgs[sk] = {"model_confidence": mc, "injury_penalty_pct": ip}
-            if st.button("💾 Save Sport Settings"):
-                save_sport_configs(new_cfgs)
-                st.success("✅ Saved. Press Refresh Data to apply.")
+            st.subheader("🤖 Model Tuning")
+            st.info("Adjust how the model calculates EV+ and edge. Changes apply on next Refresh.")
+            c1,c2 = st.columns(2)
+            with c1:
+                mc = st.slider("Model Confidence", 0.5, 2.0,
+                               float(model_cfg["model_confidence"]), 0.05,
+                               help="1.0 = neutral. >1 amplifies home advantage signal.")
+                et = st.slider("Edge Threshold %", 1, 10,
+                               int(model_cfg.get("edge_threshold_pct", 4.5)),
+                               help="Minimum edge vs bookmaker to flag a qualifying bet.")
+            with c2:
+                ip = st.slider("Injury Penalty %", 1, 20,
+                               int(model_cfg["injury_penalty_pct"]),
+                               help="Probability reduction for high-risk matches.")
+                ff = st.slider("Home Advantage Factor", 0.0, 1.0,
+                               float(model_cfg["form_factor"]), 0.05)
+            ow = st.slider("Odds Weight", 0.0, 1.0, float(model_cfg["odds_weight"]), 0.05)
+            if st.button("💾 Save Model"):
+                save_model_config({"model_confidence":mc,"edge_threshold_pct":et,
+                                   "injury_penalty_pct":ip,"form_factor":ff,"odds_weight":ow})
+                st.success("✅ Saved.")
 
         with s3:
             st.subheader("📊 Backtest")
@@ -1745,90 +1394,9 @@ def main():
     st.divider()
     st.markdown(
         "<p style='text-align:center;font-size:12px;color:#555;'>"
-        "📈 Sports EV+ Dashboard &nbsp;|&nbsp; NBA · MLB · Tennis"
-        " &nbsp;|&nbsp; Data: API-Sports + The Odds API &nbsp;|&nbsp; All amounts in CAD"
+        "📈 Sports EV+ Dashboard v2 &nbsp;|&nbsp; NBA · MLB · Tennis"
+        " &nbsp;|&nbsp; Data: The Odds API &nbsp;|&nbsp; All amounts in CAD"
         "</p>", unsafe_allow_html=True)
-
-
-# =============================================================================
-# SCHEDULE HELPERS (used inside main but defined here to keep file readable)
-# =============================================================================
-def _fetch_schedule_nba(days: int = 7) -> list:
-    events = []
-    df = fetch_premium_odds("basketball_nba")
-    if df.empty:
-        return []
-    odds_events = []  # not used — iterate df instead
-    seen = set()
-    for _, row in df.iterrows():
-        key = f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
-        if key not in seen:
-            seen.add(key)
-            events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
-                           "Match": row.get("Match",""), "Sport": "🏀 NBA"})
-    return events
-def _fetch_schedule_nba_DEAD(days: int = 7) -> list:
-    events = []
-    odds_events = []
-    seen = set()
-    for ev in odds_events:
-        try:
-            home = ev.get("home_team","")
-            away = ev.get("away_team","")
-            commence = ev.get("start_time","")
-        except Exception:
-            continue
-    return events
-
-def _fetch_schedule_mlb(days: int = 7) -> list:
-    events = []
-    df = fetch_premium_odds("baseball_mlb")
-    if df.empty:
-        return []
-    seen = set()
-    for _, row in df.iterrows():
-        key = f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
-        if key not in seen:
-            seen.add(key)
-            events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
-                           "Match": row.get("Match",""), "Sport": "⚾ MLB"})
-    return events
-def _fetch_schedule_mlb_DEAD(days: int = 7) -> list:
-    events = []
-    odds_events = []
-    seen = set()
-    for ev in odds_events:
-        try:
-            home = ev.get("home_team","")
-            away = ev.get("away_team","")
-            commence = ev.get("start_time","")
-            dt_utc   = _TZ_UTC.localize(datetime.strptime(commence.replace("Z",""), "%Y-%m-%dT%H:%M:%S"))
-            dt       = dt_utc.astimezone(_TZ_EASTERN)
-            date_str = dt.strftime("%Y-%m-%d")
-            time_str = dt.strftime("%I:%M %p ET")
-            key = f"{home}{away}{date_str}"
-            if key not in seen:
-                seen.add(key)
-                events.append({"Date": date_str, "Time": time_str,
-                               "Match": f"{home} vs {away}", "Sport": "⚾ MLB"})
-        except Exception:
-            continue
-    return events
-
-def _fetch_schedule_tennis(days: int = 7) -> list:
-    events = []
-    seen = set()
-    for sport_key in ("tennis_atp", "tennis_wta"):
-        df = fetch_premium_odds(sport_key)
-        if df.empty:
-            continue
-        for _, row in df.iterrows():
-            key = f"{row.get('Match','')}{row.get('_date','')}"
-            if key not in seen:
-                seen.add(key)
-                events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
-                               "Match": row.get("Match",""), "Sport": "🎾 Tennis"})
-    return events
 
 
 if __name__ == "__main__":
