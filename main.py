@@ -1,15 +1,3 @@
-# =============================================================================
-# Sports EV+ Dashboard — CALIBRATED REWRITE (v2)
-# Changes vs previous:
-#   Fix 1: Dead-zone calibration discount (65-70% AI prob band, -24pp empirical gap)
-#   Fix 2: MLB odds cap at 1.90 (0% WR above that in sample data)
-#   Fix 3: MIN_EDGE_THRESHOLD raised 0.5 → 4.5 (85% WR at 4.5%+ vs 70% at 3%)
-#   Fix 4: Sport-specific home boosts: NBA 0.060, MLB 0.035, Tennis 0.055
-#   Fix 5: MLB cliff-edge SP/bullpen penalty at 1.85-2.10 odds range
-#
-# Run: streamlit run main.py
-# =============================================================================
-
 import ssl, os, time, random, json, socket, urllib3, feedparser, sqlite3
 import requests
 import pandas as pd
@@ -201,14 +189,16 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     _sport_map = {
-        "basketball_nba": "basketball_nba",
-        "baseball_mlb":   "baseball_mlb",
-        "tennis_atp":     "tennis",
-        "tennis_wta":     "tennis",
+        "basketball_nba":  "basketball_nba",
+        "basketball_wnba": "basketball_wnba",
+        "baseball_mlb":    "baseball_mlb",
+        "tennis":          "tennis",
     }
     sport_label = {
-        "basketball_nba": "NBA", "baseball_mlb": "MLB",
-        "tennis_atp": "Tennis", "tennis_wta": "Tennis",
+        "basketball_nba":  "NBA",
+        "basketball_wnba": "WNBA",
+        "baseball_mlb":    "MLB",
+        "tennis":          "Tennis",
     }.get(sport_key, sport_key.upper())
 
     api_sport = _sport_map.get(sport_key, sport_key)
@@ -415,9 +405,7 @@ def build_advance_predictions(days_ahead: int, sport: str,
     cutoff  = today + timedelta(days=days_ahead)
 
     if sport == "Tennis":
-        atp = fetch_premium_odds("tennis_atp")
-        wta = fetch_premium_odds("tennis_wta")
-        combined = pd.concat([atp, wta], ignore_index=True) if (not atp.empty or not wta.empty) else pd.DataFrame()
+        combined = fetch_premium_odds("tennis")
         if combined.empty: return pd.DataFrame()
         combined = combined[combined["_date"].between(str(today), str(cutoff))].reset_index(drop=True)
         combined["_fetch_date"] = combined["_date"]
@@ -869,15 +857,14 @@ def _fetch_schedule_mlb(days: int = 7) -> list:
 
 def _fetch_schedule_tennis(days: int = 7) -> list:
     seen = set(); events = []
-    for sport_key in ("tennis_atp","tennis_wta"):
-        df = fetch_premium_odds(sport_key)
-        if df.empty: continue
-        for _, row in df.iterrows():
-            key = f"{row.get('Match','')}{row.get('_date','')}"
-            if key not in seen:
-                seen.add(key)
-                events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
-                               "Match": row.get("Match",""), "Sport": "🎾 Tennis"})
+    df = fetch_premium_odds("tennis")
+    if df.empty: return []
+    for _, row in df.iterrows():
+        key = f"{row.get('Match','')}{row.get('_date','')}"
+        if key not in seen:
+            seen.add(key)
+            events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
+                           "Match": row.get("Match",""), "Sport": "🎾 Tennis"})
     return events
 
 # =============================================================================
@@ -928,11 +915,11 @@ def main():
     col_t, col_l = st.columns([4,1])
     with col_t:
         st.markdown("<h1 style='margin:0'>📈 Sports EV+ Dashboard</h1>", unsafe_allow_html=True)
-        st.caption("NBA · MLB · Tennis — Odds API | All amounts in CAD | Model v2 (calibrated)")
+        st.caption("NBA/WNBA · MLB · Tennis — Odds API | All amounts in CAD | Model v2 (calibrated)")
     with col_l:
         if st.button("🔄 Refresh Data", use_container_width=True):
             for key in ["schedule_cache","schedule_fetched","pred_cache","pred_fetched",
-                        "data_nba","data_mlb","data_tennis","data_fetched"]:
+                        "data_nba","data_mlb","data_tennis","data_wnba","data_fetched"]:
                 st.session_state.pop(key, None)
             st.rerun()
 
@@ -943,21 +930,29 @@ def main():
     if "data_fetched" not in st.session_state or st.session_state.get("data_fetched") != today_str:
         prog = st.progress(0, text="📡 Connecting to Odds API…")
         try:
-            prog.progress(20, text="🏀 Fetching NBA…")
+            prog.progress(15, text="🏀 Fetching NBA…")
             df_nba_raw = fetch_premium_odds("basketball_nba")
             st.session_state["data_nba"] = calculate_stakes(
                 calculate_real_ev(df_nba_raw, model_cfg, "NBA"), bankroll, risk_level)
 
-            prog.progress(50, text="⚾ Fetching MLB…")
+            prog.progress(30, text="🏀 Fetching WNBA (NBA off-season fill)…")
+            df_wnba_raw = fetch_premium_odds("basketball_wnba")
+            # Merge WNBA into NBA tab if NBA is empty (off-season)
+            if df_nba_raw.empty and not df_wnba_raw.empty:
+                st.session_state["data_nba"] = calculate_stakes(
+                    calculate_real_ev(df_wnba_raw, model_cfg, "NBA"), bankroll, risk_level)
+            elif not df_wnba_raw.empty:
+                combined_bball = pd.concat([df_nba_raw, df_wnba_raw], ignore_index=True)
+                st.session_state["data_nba"] = calculate_stakes(
+                    calculate_real_ev(combined_bball, model_cfg, "NBA"), bankroll, risk_level)
+
+            prog.progress(55, text="⚾ Fetching MLB…")
             df_mlb_raw = fetch_premium_odds("baseball_mlb")
             st.session_state["data_mlb"] = calculate_stakes(
                 calculate_real_ev(df_mlb_raw, model_cfg, "MLB"), bankroll, risk_level)
 
             prog.progress(75, text="🎾 Fetching Tennis…")
-            df_atp_raw = fetch_premium_odds("tennis_atp")
-            df_wta_raw = fetch_premium_odds("tennis_wta")
-            df_tennis_raw = pd.concat([df_atp_raw, df_wta_raw], ignore_index=True) \
-                if (not df_atp_raw.empty or not df_wta_raw.empty) else pd.DataFrame()
+            df_tennis_raw = fetch_premium_odds("tennis")
             if not df_tennis_raw.empty:
                 df_tennis_raw = df_tennis_raw.drop_duplicates(subset=["Match","_date"]).reset_index(drop=True)
             st.session_state["data_tennis"] = calculate_stakes(
@@ -993,7 +988,7 @@ def main():
                 cols_to_show = [c for c in ["Match","Home Odds","Away Odds","EV+","Edge %"] if c in df_s.columns]
                 st.markdown(f"**{label} — sample EV+ values:**")
                 st.dataframe(df_s[cols_to_show].head(3), hide_index=True, use_container_width=True)
-        for label, sk in [("NBA","basketball_nba"),("MLB","baseball_mlb"),("Tennis","tennis_atp")]:
+        for label, sk in [("NBA","basketball_nba"),("MLB","baseball_mlb"),("Tennis","tennis")]:
             raw = st.session_state.get(f"debug_raw_event_{sk}")
             if raw:
                 st.markdown(f"**{label} — first raw event:**")
