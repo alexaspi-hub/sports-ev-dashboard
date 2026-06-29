@@ -1242,7 +1242,7 @@ def main():
     col_t, col_l = st.columns([4,1])
     with col_t:
         st.markdown("<h1 style='margin:0'>📈 Sports EV+ Dashboard</h1>", unsafe_allow_html=True)
-        st.caption("NBA/WNBA · MLB · Tennis — Odds API | All amounts in CAD | Model v2 (calibrated)")
+        st.caption("NBA/WNBA · MLB · Tennis — Odds API | All amounts in CAD | Model v3 (calibrated)")
     with col_l:
         if st.button("🔄 Refresh Data", use_container_width=True):
             for key in ["schedule_cache","schedule_fetched","pred_cache","pred_fetched",
