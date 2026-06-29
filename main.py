@@ -117,6 +117,12 @@ KELLY_FRACTIONS      = {"Safe": 0.25, "Moderate": 0.50, "Aggressive": 0.75}
 MAX_KELLY_PCT        = 0.20
 CB_STAKE_MULTIPLIER  = 0.50
 
+# Fix 6: Heavy-Favorite Trap — applied across ALL sports, not just MLB.
+# Below this decimal price, one unexpected loss can erase ~10 wins worth of edge;
+# risk:reward is too skewed to survive normal variance (esp. tennis early rounds).
+HEAVY_FAVORITE_FLOOR     = 1.30
+MIN_COMPLETE_SETS_TENNIS = 2   # below this, treat result as retirement/walkover, not a "real" outcome
+
 # Fix 1 dead-zone constants: 65-70% AI prob band was 24pp overestimated in backtesting
 _DZ_LO       = 0.65
 _DZ_HI       = 0.70
@@ -165,6 +171,233 @@ def log_and_get_velocity(match_name: str, home_odds: float, away_odds: float) ->
         return "平 Stable"
     except Exception:
         return "平 Stable"
+
+# =============================================================================
+# DATA HYGIENE — RAW LOG PARSING, DEDUPLICATION, SPORTSBOOK GRADING RULES
+# =============================================================================
+import re as _re
+
+# Matches a squished trailing block like: "ET1.8415W107/106", "ET1.5415FORFEIT",
+# "ET1.815L2/6 6/3 3/6". Groups: timezone, odds (decimal), stake (int), outcome
+# letter (W/L), score (rest of string, possibly containing spaces/slashes), OR
+# a non-standard outcome word (FORFEIT, RETIRED, VOID, WALKOVER, CASHOUT).
+_RAW_LOG_RE = _re.compile(
+    r"""^(?P<entity>.+?)\s*·\s*(?P<match>.+?)\s+
+        (?P<date>\d{4}-\d{2}-\d{2})\s+
+        (?P<time>\d{1,2}:\d{2}\s*[AP]M)\s*
+        (?P<tz>[A-Z]{2,4})
+        (?P<odds>\d+\.\d{2})
+        (?P<stake>\d+?)
+        (?:(?P<special>FORFEIT|RETIRED|WALKOVER|VOID|CASHOUT)
+           |(?P<outcome>[WL])(?P<score>[\d/:\s]+))
+        \s*$""",
+    _re.VERBOSE,
+)
+
+def parse_raw_log_line(line: str, known_stake: float | None = None) -> dict | None:
+    """
+    Untangle one squished raw-log line into a clean record.
+
+    Handles the "data squishing" bug where timezone, odds, stake, outcome,
+    and score run together with no delimiters (e.g. 'ET1.8415W107/106'),
+    AND non-standard terminal states like 'ET1.5415FORFEIT' that have no
+    score at all.
+
+    IMPORTANT — irreducible ambiguity: odds are sometimes logged without a
+    trailing zero (e.g. '1.8' instead of '1.80'), which makes the odds/stake
+    boundary genuinely ambiguous from the digit string alone (e.g. '1.815L'
+    could be 1.81 odds + stake 5, OR 1.8 odds + stake 15). If you bet with a
+    flat stake (this log is flat-15 throughout), pass `known_stake` so the
+    parser can pick the split that matches your real staking plan instead of
+    guessing. Without it, the parser defaults to assuming 2-decimal odds.
+
+    Returns None if the line doesn't match the expected shape (caller should
+    log/skip rather than crash the whole batch).
+    """
+    if not line or not line.strip():
+        return None
+    m = _RAW_LOG_RE.match(line.strip())
+    if not m:
+        return None
+    g = m.groupdict()
+
+    if g["special"]:
+        outcome = g["special"]
+        score   = None
+    else:
+        outcome = g["outcome"]
+        score   = g["score"].strip() if g["score"] else None
+
+    try:
+        odds = float(g["odds"])
+    except (TypeError, ValueError):
+        odds = None
+    try:
+        stake = float(g["stake"])
+    except (TypeError, ValueError):
+        stake = None
+
+    low_confidence = False
+    if known_stake is not None and stake is not None and stake != known_stake:
+        # The 2-decimal-odds split didn't match your known flat stake — try
+        # shifting one digit from odds to stake (covers '1.8' logged as '1.815...').
+        combo = f"{g['odds']}{g['stake']}"  # re-fuse the raw digit run, e.g. "1.815"
+        digits_before_dot, digits_after_dot = combo.split(".")
+        # try every odds-length split and pick the one matching known_stake
+        found = False
+        for cut in range(1, len(digits_after_dot)):
+            cand_odds_str  = f"{digits_before_dot}.{digits_after_dot[:cut]}"
+            cand_stake_str = digits_after_dot[cut:]
+            if cand_stake_str and float(cand_stake_str) == known_stake:
+                odds, stake = float(cand_odds_str), float(cand_stake_str)
+                found = True
+                break
+        if not found:
+            low_confidence = True
+
+    return {
+        "entity":    g["entity"].strip(),
+        "match":     g["match"].strip(),
+        "date":      g["date"],
+        "time":      g["time"].replace(" ", "") ,
+        "tz":        g["tz"],
+        "odds":      odds,
+        "stake":     stake,
+        "outcome":   outcome,           # "W" / "L" / "FORFEIT" / "RETIRED" / ...
+        "score":     score,             # e.g. "107/106", "6/1 6/3", or None
+        "low_confidence_split": low_confidence,  # True = odds/stake boundary was ambiguous
+        "raw_line":  line.strip(),
+    }
+
+
+def parse_raw_log_batch(lines: list[str], known_stake: float | None = None) -> pd.DataFrame:
+    """Parse many raw log lines; rows that fail to parse are kept with a
+    '_parse_failed' flag instead of being silently dropped, so you can see
+    exactly which lines need a format tweak rather than losing data.
+    Pass known_stake (e.g. 15.0 for a flat-stake bettor) to correctly resolve
+    the odds/stake boundary on lines where odds lack a trailing zero."""
+    records = []
+    for ln in lines:
+        rec = parse_raw_log_line(ln, known_stake=known_stake)
+        if rec is None:
+            records.append({"raw_line": ln, "_parse_failed": True})
+        else:
+            rec["_parse_failed"] = False
+            records.append(rec)
+    return pd.DataFrame(records)
+
+
+def _normalize_player_key(match_str: str) -> str:
+    """Order-independent key for 'A vs B' so 'A vs B' and 'B vs A' collide."""
+    parts = [p.strip().lower() for p in _re.split(r"\s+vs\s+", str(match_str))]
+    return "|".join(sorted(parts))
+
+
+def dedupe_match_logs(df: pd.DataFrame, date_col: str = "date",
+                       match_col: str = "match") -> pd.DataFrame:
+    """
+    Fix: Rain-Delay / Duplicate Logging Bug.
+
+    When a suspended match gets re-logged under a later timestamp, the same
+    fixture appears twice with different dates. This keeps only ONE row per
+    fixture: the row with the LATEST date/time AND a fully-graded outcome
+    (real W/L with a complete score), preferring that over an earlier
+    in-progress/void/forfeit snapshot of the same match.
+    """
+    if df is None or df.empty:
+        return df
+    work = df.copy()
+    work["_pkey"] = work[match_col].apply(_normalize_player_key)
+
+    def _is_final(row) -> bool:
+        outcome = str(row.get("outcome", "")).upper()
+        return outcome in ("W", "L")
+
+    work["_is_final"] = work.apply(_is_final, axis=1)
+    work["_sort_dt"]  = pd.to_datetime(work.get(date_col), errors="coerce")
+
+    # Prefer: final outcome first, then most recent date — so a later FORFEIT
+    # snapshot doesn't get kept over an earlier completed result, and a final
+    # result always wins over an unresolved/void duplicate either direction.
+    work = work.sort_values(["_pkey", "_is_final", "_sort_dt"],
+                             ascending=[True, False, False])
+    deduped = work.drop_duplicates(subset="_pkey", keep="first")
+    return deduped.drop(columns=["_pkey", "_is_final", "_sort_dt"]).reset_index(drop=True)
+
+
+def _count_completed_sets(score: str | None) -> int:
+    """Count finished sets in a tennis score string like '6/4 7/6' or '6/7 4/6'."""
+    if not score:
+        return 0
+    sets = [s for s in str(score).split() if "/" in s]
+    return len(sets)
+
+
+def grade_with_sportsbook_rules(outcome: str, score: str | None,
+                                 sport: str = "Tennis",
+                                 grading_rule: str = "1st_set") -> dict:
+    """
+    Apply ACTUAL sportsbook grading rules instead of "ideal" outcomes.
+
+    Rainbet (and similarly-ruled books) grade retirements/walkovers using a
+    1st-ball or 1st-set action rule: if action started (or the 1st set
+    finished) before the retirement, the bet still grades as a normal
+    W/L on whoever was leading at that point — it is NOT voided.
+
+    Args:
+        outcome:      raw outcome token ("W","L","FORFEIT","RETIRED","WALKOVER","VOID")
+        score:        score string, e.g. "0:0", "1:0", "6/4 3/1" (retired mid-set)
+        sport:        sport label (only Tennis has set-based grading here)
+        grading_rule: "1st_set" (must complete 1 full set to count) or
+                      "1st_ball" (any action at all counts, even 0:0/1:0)
+
+    Returns dict: {"graded_outcome": "W"/"L"/"VOID", "is_void": bool, "note": str}
+    """
+    outcome_u = (outcome or "").upper()
+    sets_done = _count_completed_sets(score)
+
+    if outcome_u in ("W", "L"):
+        return {"graded_outcome": outcome_u, "is_void": False, "note": "Standard completed result."}
+
+    if outcome_u in ("FORFEIT", "RETIRED", "WALKOVER"):
+        if sport != "Tennis":
+            return {"graded_outcome": "VOID", "is_void": True, "note": "Non-tennis retirement — treat as void by default."}
+
+        if grading_rule == "1st_ball":
+            # Rainbet-style: any action counted as a result, even 0:0/1:0 pre-match retirements.
+            return {"graded_outcome": "W", "is_void": False,
+                    "note": "1st-ball rule: book graded this as a live result despite early retirement; "
+                            "do not void in backtest — it cost/won real money."}
+
+        # "1st_set" rule: needs >=1 completed set to be a graded result, not a void.
+        if sets_done >= 1:
+            return {"graded_outcome": "W", "is_void": False,
+                    "note": f"{sets_done} set(s) completed before retirement — books grade this live, not void."}
+        return {"graded_outcome": "VOID", "is_void": True,
+                "note": "No completed set before retirement — true void under 1st-set rule."}
+
+    return {"graded_outcome": "VOID", "is_void": True, "note": f"Unrecognized outcome token: {outcome!r}"}
+
+
+def apply_sportsbook_grading(df: pd.DataFrame, outcome_col: str = "outcome",
+                              score_col: str = "score", sport_col: str = "sport",
+                              grading_rule: str = "1st_set") -> pd.DataFrame:
+    """Vectorized application of grade_with_sportsbook_rules across a trade log,
+    so backtests reflect what Rainbet actually paid/took, not the 'ideal' result."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    graded, voided, notes = [], [], []
+    for _, row in out.iterrows():
+        sport = row.get(sport_col, "Tennis") if sport_col in out.columns else "Tennis"
+        g = grade_with_sportsbook_rules(row.get(outcome_col), row.get(score_col), sport, grading_rule)
+        graded.append(g["graded_outcome"]); voided.append(g["is_void"]); notes.append(g["note"])
+    out["graded_outcome"] = graded
+    out["is_void"]        = voided
+    out["grading_note"]   = notes
+    return out
+
+
 
 # =============================================================================
 # NETWORK
@@ -219,7 +452,7 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
 
     import json as _json
     payload = resp.json()
-    events  = payload.get("data", [])
+    events  = payload.get("data") or []
     print(f"[DEBUG] Got {len(events)} events for {sport_key}")
 
     if not events:
@@ -233,6 +466,7 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
 
     for ev in events:
         try:
+            event_id = ev.get("event_id", "")
             home  = ev.get("home_team", "")
             away  = ev.get("away_team", "")
             start = ev.get("start_time", "")
@@ -244,10 +478,13 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
             except Exception:
                 time_str = "TBD"; ev_date = ""
 
-            best_h = best_a = 0.0; book_count = 0
-            for bk in ev.get("books", []):
+            best_h = best_a = 0.0; book_count = 0; latest_update = ""
+            for bk in (ev.get("books") or []):
                 if bk.get("market") != "h2h": continue
-                for outcome in bk.get("outcomes", []):
+                upd = bk.get("updated_at", "")
+                if upd and upd > latest_update:
+                    latest_update = upd
+                for outcome in (bk.get("outcomes") or []):
                     price = american_to_decimal(float(outcome.get("price", 0)))
                     name  = outcome.get("name", "")
                     if name == home and price > best_h: best_h = price
@@ -263,7 +500,13 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
                 if not (0.90 <= imp_sum <= 1.25):
                     skipped_imp += 1; continue
 
+            # event_id is the stable identity from the API — fall back to a
+            # name-based key only if the API omits it, so dedupe/velocity
+            # tracking doesn't silently break on a missing field.
+            velocity_key = event_id or f"{home} vs {away}"
+
             rows.append({
+                "_event_id":    event_id,
                 "Match":        f"{home} vs {away}",
                 "Home Team":    home,
                 "Away Team":    away,
@@ -276,7 +519,8 @@ def fetch_premium_odds(sport_key: str) -> pd.DataFrame:
                 "_sport":       sport_label,
                 "_date":        ev_date,
                 "_start_iso":   start,
-                "Line Velocity": log_and_get_velocity(f"{home} vs {away}", best_h, best_a),
+                "_updated_at":  latest_update,
+                "Line Velocity": log_and_get_velocity(velocity_key, best_h, best_a),
             })
         except Exception as _exc:
             print(f"[DEBUG] parse error: {_exc} — {ev}"); continue
@@ -395,6 +639,74 @@ def calculate_stakes(df: pd.DataFrame, bankroll: float, risk_level: str) -> pd.D
     df["_simultaneous_trades"] = active_simultaneous_trades
     return df
 
+
+def compare_straight_vs_parlay(legs: list[dict], bankroll: float, risk_level: str = "Moderate") -> dict:
+    """
+    Quantifies why straight (single-game) Kelly bets beat the same legs combined
+    into a parlay/combo bet — the leak flagged in the Rainbet slips.
+
+    Args:
+        legs: list of {"prob": true_win_probability (0-1), "odds": decimal_odds} per leg.
+        bankroll, risk_level: same semantics as calculate_stakes.
+
+    Returns a dict comparing: total stake risked, expected profit, and variance
+    for (a) staking each leg straight with fractional Kelly vs (b) combining all
+    legs into one parlay at the product odds/probability.
+    """
+    frac = KELLY_FRACTIONS.get(risk_level, 0.5)
+
+    # --- Straight bets: independent fractional-Kelly stake per leg ---
+    straight_stake_total = 0.0
+    straight_ev_total     = 0.0
+    straight_var_total    = 0.0
+    for leg in legs:
+        p, o = leg["prob"], leg["odds"]
+        b = o - 1.0
+        edge = p * b - (1 - p)
+        if edge <= 0:
+            continue
+        kelly_pct = min((edge / b) * frac, 0.05)
+        stake = kelly_pct * bankroll
+        ev    = stake * edge
+        var   = (stake ** 2) * p * (1 - p) * (b + 1) ** 2  # win/loss payoff variance
+        straight_stake_total += stake
+        straight_ev_total    += ev
+        straight_var_total   += var  # independent legs → variances add
+
+    # --- Parlay: all legs must hit; odds multiply, probability multiplies ---
+    parlay_prob = 1.0
+    parlay_odds = 1.0
+    for leg in legs:
+        parlay_prob *= leg["prob"]
+        parlay_odds *= leg["odds"]
+    b_p = parlay_odds - 1.0
+    parlay_edge = parlay_prob * b_p - (1 - parlay_prob)
+    if parlay_edge > 0 and b_p > 0:
+        parlay_kelly_pct = min((parlay_edge / b_p) * frac, 0.05)
+        parlay_stake     = parlay_kelly_pct * bankroll
+    else:
+        parlay_stake = 0.0
+    parlay_ev  = parlay_stake * parlay_edge
+    parlay_var = (parlay_stake ** 2) * parlay_prob * (1 - parlay_prob) * (b_p + 1) ** 2
+
+    return {
+        "straight": {"total_stake": round(straight_stake_total, 2),
+                     "expected_profit": round(straight_ev_total, 2),
+                     "variance": round(straight_var_total, 2),
+                     "std_dev": round(straight_var_total ** 0.5, 2)},
+        "parlay":   {"total_stake": round(parlay_stake, 2),
+                     "expected_profit": round(parlay_ev, 2),
+                     "implied_prob": round(parlay_prob * 100, 3),
+                     "variance": round(parlay_var, 2),
+                     "std_dev": round(parlay_var ** 0.5, 2)},
+        "verdict": ("Straight bets win" if straight_ev_total >= parlay_ev
+                    else "Parlay technically higher EV but check variance"),
+        "why": ("Each leg has independent edge captured at fair stake size; "
+                "a parlay multiplies probabilities (shrinking win-rate toward zero) "
+                "while concentrating the entire stake on a single all-or-nothing event, "
+                "so one bad leg erases the EV+ of every other leg combined."),
+    }
+
 # =============================================================================
 # ADVANCE PREDICTIONS
 # =============================================================================
@@ -462,6 +774,20 @@ def find_top_bets(*dfs, n: int = 8, per_sport_cap: int = 3, hours: int = 48) -> 
         if sport_name == "MLB":
             h_col = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
             df = df[pd.to_numeric(df[h_col], errors="coerce").fillna(99) <= MLB_MAX_ODDS].copy()
+        if df.empty: continue
+
+        # Fix 6: Heavy-Favorite Trap — exclude prices below HEAVY_FAVORITE_FLOOR for
+        # ALL sports (not just MLB). The recommended side is always the LOWER-odds
+        # (favorite) leg — see bet_tag logic below — so that's the price to floor.
+        # At 1.09–1.25 you risk far more than you can win; one unexpected upset
+        # erases ~10 winning bets' worth of edge.
+        h_col2 = "Home Odds" if "Home Odds" in df.columns else "P1 Odds"
+        a_col2 = "Away Odds" if "Away Odds" in df.columns else "P2 Odds"
+        bet_price = pd.concat([
+            pd.to_numeric(df[h_col2], errors="coerce"),
+            pd.to_numeric(df[a_col2], errors="coerce"),
+        ], axis=1).min(axis=1).fillna(0)
+        df = df[bet_price >= HEAVY_FAVORITE_FLOOR].copy()
         if df.empty: continue
 
         ev   = pd.to_numeric(df["EV+"],    errors="coerce")
@@ -836,7 +1162,7 @@ def _fetch_schedule_nba(days: int = 7) -> list:
     if df.empty: return []
     seen = set(); events = []
     for _, row in df.iterrows():
-        key = f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
+        key = row.get("_event_id") or f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
         if key not in seen:
             seen.add(key)
             events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
@@ -848,7 +1174,7 @@ def _fetch_schedule_mlb(days: int = 7) -> list:
     if df.empty: return []
     seen = set(); events = []
     for _, row in df.iterrows():
-        key = f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
+        key = row.get("_event_id") or f"{row.get('Home Team','')}{row.get('Away Team','')}{row.get('_date','')}"
         if key not in seen:
             seen.add(key)
             events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
@@ -860,7 +1186,7 @@ def _fetch_schedule_tennis(days: int = 7) -> list:
     df = fetch_premium_odds("tennis")
     if df.empty: return []
     for _, row in df.iterrows():
-        key = f"{row.get('Match','')}{row.get('_date','')}"
+        key = row.get("_event_id") or f"{row.get('Match','')}{row.get('_date','')}"
         if key not in seen:
             seen.add(key)
             events.append({"Date": row.get("_date",""), "Time": row.get("Time/Score","TBD"),
@@ -905,8 +1231,9 @@ def main():
         st.caption("If Rainbet shows 1.85 on a game, enter 1.85 here.")
         st.divider()
         st.caption(
-            "📊 **Model calibration (v2)**\n"
-            f"Edge threshold: {MIN_EDGE_THRESHOLD}% | MLB cap: {MLB_MAX_ODDS}x\n"
+            "📊 **Model calibration (v3)**\n"
+            f"Edge threshold: {MIN_EDGE_THRESHOLD}% | MLB cap: {MLB_MAX_ODDS}x | "
+            f"Heavy-favorite floor: {HEAVY_FAVORITE_FLOOR}x (all sports)\n"
             "Dead-zone discount: 65–70% band → ×0.88\n"
             "Boosts: NBA 6% | MLB 3.5% | Tennis 5.5%"
         )
@@ -954,7 +1281,8 @@ def main():
             prog.progress(75, text="🎾 Fetching Tennis…")
             df_tennis_raw = fetch_premium_odds("tennis")
             if not df_tennis_raw.empty:
-                df_tennis_raw = df_tennis_raw.drop_duplicates(subset=["Match","_date"]).reset_index(drop=True)
+                dedupe_cols = ["_event_id"] if "_event_id" in df_tennis_raw.columns and df_tennis_raw["_event_id"].astype(bool).any() else ["Match","_date"]
+                df_tennis_raw = df_tennis_raw.drop_duplicates(subset=dedupe_cols).reset_index(drop=True)
             st.session_state["data_tennis"] = calculate_stakes(
                 calculate_real_ev(df_tennis_raw, model_cfg, "Tennis"), bankroll, risk_level)
 
