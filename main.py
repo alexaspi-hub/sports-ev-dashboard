@@ -32,8 +32,14 @@ st.set_page_config(
     page_title="Sports EV+ Dashboard",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
+
+st.markdown("""
+<style>
+[data-testid="collapsedControl"] { display: none; }
+</style>
+""", unsafe_allow_html=True)
 
 st.markdown("""
 <style>
@@ -1211,25 +1217,21 @@ def main():
     model_cfg    = load_model_config()
     bankroll_cfg = load_bankroll_config()
 
-    # ── Sidebar ───────────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.subheader("⚙️ Settings")
-        bankroll   = st.number_input("Bankroll (C$)", min_value=100.0, value=1500.0, step=100.0)
-        risk_level = st.radio("Kelly Risk Level", ["Safe","Moderate","Aggressive"], index=1)
-        st.divider()
-        st.subheader("📡 Data Sources")
-        st.markdown(f"**All sports:** {'✅ Premium Odds API' if ODDS_API_KEY else '❌ ODDS_API_KEY missing'}")
-        st.caption("NBA · MLB · Tennis ATP · Tennis WTA — all via The Odds API Premium")
-        st.divider()
-        st.subheader("📅 Prediction Window")
-        days_ahead = st.slider("Days ahead to predict", 0, 7, 2)
-        st.divider()
-        st.subheader("🎯 Manual Rainbet Override")
-        rainbet_multiplier = st.number_input(
-            "Current Rainbet Multiplier (X)", min_value=1.01, max_value=50.0, value=1.90, step=0.05,
-            help="Enter the live decimal odds from Rainbet.")
-        st.caption("If Rainbet shows 1.85 on a game, enter 1.85 here.")
-        st.divider()
+    # ── Settings (in-page, sidebar removed) ─────────────────────────────────
+    with st.expander("⚙️ Settings", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            bankroll   = st.number_input("Bankroll (C$)", min_value=100.0, value=1500.0, step=100.0)
+            risk_level = st.radio("Kelly Risk Level", ["Safe","Moderate","Aggressive"], index=1)
+        with c2:
+            days_ahead = st.slider("Days ahead to predict", 0, 7, 2)
+            st.markdown(f"**All sports:** {'✅ Premium Odds API' if ODDS_API_KEY else '❌ ODDS_API_KEY missing'}")
+            st.caption("NBA · MLB · Tennis ATP · Tennis WTA — all via The Odds API Premium")
+        with c3:
+            rainbet_multiplier = st.number_input(
+                "Current Rainbet Multiplier (X)", min_value=1.01, max_value=50.0, value=1.90, step=0.05,
+                help="Enter the live decimal odds from Rainbet.")
+            st.caption("If Rainbet shows 1.85 on a game, enter 1.85 here.")
         st.caption(
             "📊 **Model calibration (v3)**\n"
             f"Edge threshold: {MIN_EDGE_THRESHOLD}% | MLB cap: {MLB_MAX_ODDS}x | "
@@ -1242,9 +1244,13 @@ def main():
     col_t, col_l = st.columns([4,1])
     with col_t:
         st.markdown("<h1 style='margin:0'>📈 Sports EV+ Dashboard</h1>", unsafe_allow_html=True)
-        st.caption("NBA/WNBA · MLB · Tennis — Odds API | All amounts in CAD | Model v3 (calibrated)")
+        st.caption("NBA/WNBA · MLB · Tennis — Odds API | All amounts in CAD | Model v2 (calibrated)")
     with col_l:
-        if st.button("🔄 Refresh Data", use_container_width=True):
+        if st.button("🔄 Force Refresh Data", use_container_width=True):
+            # Wipes the @st.cache_data-backed fetch_premium_odds cache so a
+            # stuck/stale response can never survive a click — clearing only
+            # session_state (as before) left the underlying cache intact.
+            st.cache_data.clear()
             for key in ["schedule_cache","schedule_fetched","pred_cache","pred_fetched",
                         "data_nba","data_mlb","data_tennis","data_wnba","data_fetched"]:
                 st.session_state.pop(key, None)
